@@ -2,6 +2,7 @@ import io
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from commonroad.scenario.lanelet import Lanelet, LaneletNetwork, LineMarking, StopLine
@@ -37,6 +38,9 @@ from crdesigner.map_conversion.lanelet2.lanelet2cr import (
     _add_closest_traffic_sign_to_lanelet,
     _add_stop_line_to_lanelet,
     _two_vertices_coincide,
+)
+from crdesigner.verification_repairing.verification.hol.functions.predicates.lanelet_predicates import (
+    _wrong_left_right_boundary_side,
 )
 
 with open(
@@ -658,6 +662,37 @@ class TestLanelet2CRConverter(unittest.TestCase):
             y -= l2cr.origin_utm[1]
             self.assertEqual(v[0], x)
             self.assertEqual(v[1], y)
+
+    def test_order_way_nodes_reorders_unordered_way(self):
+        custom_osm = OSMLanelet()
+        l2cr = Lanelet2CRConverter()
+
+        n1 = Node("1", 50.0, 8.0)
+        n2 = Node("2", 50.0, 8.0002)
+        n3 = Node("3", 50.0, 8.0001)
+        custom_osm.add_node(n1)
+        custom_osm.add_node(n2)
+        custom_osm.add_node(n3)
+
+        way = Way("11", ["1", "2", "3"])
+        custom_osm.add_way(way)
+
+        # initialize projection context used by _convert_way_to_vertices
+        l2cr(custom_osm)
+        l2cr._order_way_nodes(way)
+
+        self.assertEqual(way.nodes, ["1", "3", "2"])
+
+    def test_wrong_left_right_boundary_side_handles_clcs_failure(self):
+        center = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+        left = np.array([[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]])
+        right = np.array([[0.0, -1.0], [1.0, -1.0], [2.0, -1.0]])
+
+        with patch(
+            "crdesigner.verification_repairing.verification.hol.functions.predicates.lanelet_predicates.CurvilinearCoordinateSystem",
+            side_effect=RuntimeError("clcs failed"),
+        ):
+            self.assertFalse(_wrong_left_right_boundary_side(center, left, right))
 
     def test__two_vertices_coincide(self):
         v1 = np.array([[0, 0], [0, 1]])
