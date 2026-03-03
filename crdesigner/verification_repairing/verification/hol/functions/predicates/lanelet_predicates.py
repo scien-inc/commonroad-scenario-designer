@@ -181,7 +181,15 @@ def _wrong_left_right_boundary_side(
 
     # >= since we use the function also for the lanelet2cr conversion where it might be
     # that start/ending vertices of forks/merges match
-    return sum(left - right >= 0) / len(left) < config.perc_vert_wrong_side
+    if left is None or right is None:
+        logging.debug("_wrong_left_right_boundary_side: CLCS conversion failed, keep boundary order")
+        return False
+
+    n = min(len(left), len(right))
+    if n == 0:
+        return False
+
+    return sum(left[:n] - right[:n] >= 0) / n < config.perc_vert_wrong_side
 
 
 def has_predecessor(lanelet_0: Lanelet, lanelet_1: Lanelet) -> bool:

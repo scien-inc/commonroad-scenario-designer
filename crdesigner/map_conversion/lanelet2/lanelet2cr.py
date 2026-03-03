@@ -805,6 +805,10 @@ class Lanelet2CRConverter:
         left_way = self.osm.find_way_by_id(way_rel.left_way)
         right_way = self.osm.find_way_by_id(way_rel.right_way)
 
+        # ensure node order follows the geometry even if an input way is unordered
+        self._order_way_nodes(left_way)
+        self._order_way_nodes(right_way)
+
         # a conversion bug happens if the outer ways of adjacent lanelets don't have the same number of nodes
         # it is solved in 'repair_normal_adjacency' function of the LaneletRepairing class.
         if len(left_way.nodes) != len(right_way.nodes):
@@ -815,6 +819,10 @@ class Lanelet2CRConverter:
             )
 
             self._fix_relation_unequal_ways(left_way, right_way)
+
+            # keep ordering consistent after adding interpolated nodes
+            self._order_way_nodes(left_way)
+            self._order_way_nodes(right_way)
 
         # If for some reason, relation couldn't be fixed, notify user
         if len(left_way.nodes) != len(right_way.nodes):
@@ -1246,6 +1254,82 @@ class Lanelet2CRConverter:
             vertices[i] = [x, y, float(nd.ele)] if nd.ele != "0.0" else [x, y]
 
         return vertices
+
+    @staticmethod
+    def _polyline_length(points: np.ndarray) -> float:
+        if len(points) < 2:
+            return 0.0
+        diffs = points[1:, :2] - points[:-1, :2]
+        return float(np.sum(np.hypot(diffs[:, 0], diffs[:, 1])))
+
+    @staticmethod
+    def _order_polyline_indices(points: np.ndarray) -> np.ndarray:
+        n = len(points)
+        if n <= 2:
+            return np.arange(n)
+        if not np.isfinite(points).all():
+            return np.arange(n)
+
+        in_tree = np.zeros(n, dtype=bool)
+        dist = np.full(n, np.inf)
+        parent = np.full(n, -1, dtype=int)
+        dist[0] = 0.0
+
+        for _ in range(n):
+            idx = int(np.argmin(np.where(in_tree, np.inf, dist)))
+            if in_tree[idx] or not np.isfinite(dist[idx]):
+                break
+            in_tree[idx] = True
+            diffs = points - points[idx]
+            d = np.hypot(diffs[:, 0], diffs[:, 1])
+            mask = ~in_tree & (d < dist)
+            dist[mask] = d[mask]
+            parent[mask] = idx
+
+        adj = [[] for _ in range(n)]
+        for i in range(1, n):
+            p = parent[i]
+            if p < 0:
+                continue
+            w = float(np.hypot(points[i, 0] - points[p, 0], points[i, 1] - points[p, 1]))
+            adj[i].append((p, w))
+            adj[p].append((i, w))
+
+        endpoints = [i for i, neighbors in enumerate(adj) if len(neighbors) == 1]
+        start = endpoints[0] if endpoints else 0
+
+        stack = [start]
+        dist_tree = {start: 0.0}
+        while stack:
+            u = stack.pop()
+            for v, w in adj[u]:
+                if v not in dist_tree:
+                    dist_tree[v] = dist_tree[u] + w
+                    stack.append(v)
+
+        if len(dist_tree) < n:
+            return np.arange(n)
+
+        order = np.array(sorted(dist_tree.keys(), key=lambda i: dist_tree[i]), dtype=int)
+
+        # keep orientation close to the original first point
+        orig_first = points[0]
+        if np.linalg.norm(points[order[-1]] - orig_first) < np.linalg.norm(
+            points[order[0]] - orig_first
+        ):
+            order = order[::-1]
+        return order
+
+    def _order_way_nodes(self, way: Way) -> None:
+        if len(way.nodes) <= 2:
+            return
+        vertices = self._convert_way_to_vertices(way)
+        order = self._order_polyline_indices(vertices[:, :2])
+        if np.array_equal(order, np.arange(len(way.nodes))):
+            return
+        ordered_vertices = vertices[order]
+        if self._polyline_length(ordered_vertices[:, :2]) <= self._polyline_length(vertices[:, :2]):
+            way.nodes = [way.nodes[i] for i in order.tolist()]
 
     def node_distance(self, node_id1: str, node_id2: str) -> float:
         """
