@@ -872,7 +872,11 @@ class Lanelet2CRConverter:
         )
 
         wrong_left_right_boundary_side = _wrong_left_right_boundary_side(
-            center_vertices, left_vertices, right_vertices, lanelet2_config
+            center_vertices,
+            left_vertices,
+            right_vertices,
+            lanelet2_config,
+            context=f"way_rel={way_rel.id_}",
         )
 
         if wrong_left_right_boundary_side:

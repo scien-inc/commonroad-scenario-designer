@@ -1,5 +1,6 @@
 import itertools
 import logging
+import os
 from collections import Counter
 
 import numpy as np
@@ -17,6 +18,30 @@ from shapely import LineString
 from similaritymeasures import similaritymeasures
 
 from crdesigner.common.config.lanelet2_config import Lanelet2Config
+
+_BOUNDARY_SIDE_FALLBACK_COUNT = 0
+
+
+def _strict_boundary_side_check_enabled() -> bool:
+    return os.getenv("CRDESIGNER_STRICT_BOUNDARY_SIDE_CHECK", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _record_boundary_side_fallback(context: str = "") -> int:
+    global _BOUNDARY_SIDE_FALLBACK_COUNT
+    _BOUNDARY_SIDE_FALLBACK_COUNT += 1
+    ctx = f", context={context}" if context else ""
+    if _BOUNDARY_SIDE_FALLBACK_COUNT <= 10 or _BOUNDARY_SIDE_FALLBACK_COUNT % 100 == 0:
+        logging.warning(
+            "Boundary-side fallback triggered (count=%d%s)",
+            _BOUNDARY_SIDE_FALLBACK_COUNT,
+            ctx,
+        )
+    return _BOUNDARY_SIDE_FALLBACK_COUNT
 
 
 def has_left_adj_ref(lanelet: Lanelet) -> bool:
@@ -138,6 +163,7 @@ def _wrong_left_right_boundary_side(
     left_vertices: np.ndarray,
     right_vertices: np.ndarray,
     config: Lanelet2Config = Lanelet2Config(),
+    context: str = "",
 ) -> bool:
     """
     Checks whether left and right boundary are swapped.
@@ -182,7 +208,10 @@ def _wrong_left_right_boundary_side(
     # >= since we use the function also for the lanelet2cr conversion where it might be
     # that start/ending vertices of forks/merges match
     if left is None or right is None:
-        logging.debug("_wrong_left_right_boundary_side: CLCS conversion failed, keep boundary order")
+        msg = "Boundary-side CLCS conversion failed"
+        if _strict_boundary_side_check_enabled():
+            raise RuntimeError(f"{msg}; context={context}" if context else msg)
+        _record_boundary_side_fallback(context)
         return False
 
     n = min(len(left), len(right))

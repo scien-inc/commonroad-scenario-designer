@@ -694,6 +694,24 @@ class TestLanelet2CRConverter(unittest.TestCase):
         ):
             self.assertFalse(_wrong_left_right_boundary_side(center, left, right))
 
+    def test_wrong_left_right_boundary_side_strict_mode_raises(self):
+        center = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+        left = np.array([[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]])
+        right = np.array([[0.0, -1.0], [1.0, -1.0], [2.0, -1.0]])
+
+        with patch.dict(os.environ, {"CRDESIGNER_STRICT_BOUNDARY_SIDE_CHECK": "1"}, clear=False):
+            with patch(
+                "crdesigner.verification_repairing.verification.hol.functions.predicates.lanelet_predicates.CurvilinearCoordinateSystem",
+                side_effect=RuntimeError("clcs failed"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    _wrong_left_right_boundary_side(
+                        center,
+                        left,
+                        right,
+                        context="way_rel=111",
+                    )
+
     def test__two_vertices_coincide(self):
         v1 = np.array([[0, 0], [0, 1]])
         v2 = np.array([[0, 0], [0, 1]])
