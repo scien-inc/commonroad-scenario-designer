@@ -447,6 +447,36 @@ class TestConversionLanelet(unittest.TestCase):
         conversion_lanelet_network.set_adjacent_right(lanelet_1, "50.0.0.2", False)
         self.assertFalse(lanelet_1_adj_right.adj_right_same_direction)
 
+    def test_set_adjacent_left_clears_old_reverse_reference(self):
+        conversion_lanelet_network = ConversionLaneletNetwork()
+
+        lanelet_a = init_lanelet_empty_vertices_from_id(None, "50.0.0.1")
+        lanelet_b = init_lanelet_empty_vertices_from_id(None, "50.0.0.2")
+        lanelet_c = init_lanelet_empty_vertices_from_id(None, "50.0.0.3")
+        add_lanelets_to_network(conversion_lanelet_network, [lanelet_a, lanelet_b, lanelet_c])
+
+        conversion_lanelet_network.set_adjacent_right(lanelet_a, "50.0.0.2", True)
+        conversion_lanelet_network.set_adjacent_left(lanelet_b, "50.0.0.3", True)
+
+        self.assertIsNone(lanelet_a.adj_right)
+        self.assertEqual("50.0.0.3", lanelet_b.adj_left)
+        self.assertEqual("50.0.0.2", lanelet_c.adj_right)
+
+    def test_set_adjacent_right_clears_old_reverse_reference(self):
+        conversion_lanelet_network = ConversionLaneletNetwork()
+
+        lanelet_a = init_lanelet_empty_vertices_from_id(None, "50.0.0.1")
+        lanelet_b = init_lanelet_empty_vertices_from_id(None, "50.0.0.2")
+        lanelet_c = init_lanelet_empty_vertices_from_id(None, "50.0.0.3")
+        add_lanelets_to_network(conversion_lanelet_network, [lanelet_a, lanelet_b, lanelet_c])
+
+        conversion_lanelet_network.set_adjacent_left(lanelet_a, "50.0.0.2", True)
+        conversion_lanelet_network.set_adjacent_right(lanelet_b, "50.0.0.3", True)
+
+        self.assertIsNone(lanelet_a.adj_left)
+        self.assertEqual("50.0.0.3", lanelet_b.adj_right)
+        self.assertEqual("50.0.0.2", lanelet_c.adj_left)
+
     def test_check_concatenation_potential(self):
         conversion_lanelet_network = ConversionLaneletNetwork()
 

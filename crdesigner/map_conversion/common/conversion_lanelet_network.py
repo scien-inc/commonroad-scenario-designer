@@ -346,6 +346,44 @@ class ConversionLaneletNetwork(LaneletNetwork):
             predecessor = self.find_lanelet_by_id(predecessor_id)
             predecessor.successor.append(lanelet.lanelet_id)
 
+    def _clear_adjacent_left(self, lanelet: ConversionLanelet):
+        """Clear left adjacency and remove reverse reference from neighbor."""
+        if lanelet.adj_left is None:
+            lanelet.adj_left_same_direction = False
+            return
+
+        old_adj = self.find_lanelet_by_id(lanelet.adj_left)
+        if old_adj:
+            if lanelet.adj_left_same_direction:
+                if old_adj.adj_right == lanelet.lanelet_id:
+                    old_adj.adj_right = None
+                    old_adj.adj_right_same_direction = False
+            elif old_adj.adj_left == lanelet.lanelet_id:
+                old_adj.adj_left = None
+                old_adj.adj_left_same_direction = False
+
+        lanelet.adj_left = None
+        lanelet.adj_left_same_direction = False
+
+    def _clear_adjacent_right(self, lanelet: ConversionLanelet):
+        """Clear right adjacency and remove reverse reference from neighbor."""
+        if lanelet.adj_right is None:
+            lanelet.adj_right_same_direction = False
+            return
+
+        old_adj = self.find_lanelet_by_id(lanelet.adj_right)
+        if old_adj:
+            if lanelet.adj_right_same_direction:
+                if old_adj.adj_left == lanelet.lanelet_id:
+                    old_adj.adj_left = None
+                    old_adj.adj_left_same_direction = False
+            elif old_adj.adj_right == lanelet.lanelet_id:
+                old_adj.adj_right = None
+                old_adj.adj_right_same_direction = False
+
+        lanelet.adj_right = None
+        lanelet.adj_right_same_direction = False
+
     def set_adjacent_left(
         self, lanelet: ConversionLanelet, adj_left_id: str, same_direction: bool = True
     ) -> bool:
@@ -362,6 +400,13 @@ class ConversionLaneletNetwork(LaneletNetwork):
         new_adj = self.find_lanelet_by_id(adj_left_id)
         if not new_adj:
             return False
+
+        self._clear_adjacent_left(lanelet)
+        if same_direction:
+            self._clear_adjacent_right(new_adj)
+        else:
+            self._clear_adjacent_left(new_adj)
+
         lanelet.adj_left = adj_left_id
         lanelet.adj_left_same_direction = same_direction
         if same_direction:
@@ -388,6 +433,13 @@ class ConversionLaneletNetwork(LaneletNetwork):
         new_adj = self.find_lanelet_by_id(adj_right_id)
         if not new_adj:
             return False
+
+        self._clear_adjacent_right(lanelet)
+        if same_direction:
+            self._clear_adjacent_left(new_adj)
+        else:
+            self._clear_adjacent_right(new_adj)
+
         lanelet.adj_right = adj_right_id
         lanelet.adj_right_same_direction = same_direction
         if same_direction:
