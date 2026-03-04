@@ -33,6 +33,7 @@ from crdesigner.map_conversion.osm2cr.converter_modules.osm_operations.downloade
     download_around_map,
 )
 from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
+    apply_commonroad_sumo_lane_grouping_patch,
     apply_commonroad_sumo_nd_patch,
     apply_commonroad_sumo_traffic_light_patch,
 )
@@ -520,6 +521,7 @@ class MapConversionToolboxController(QDockWidget):
             return
 
         apply_commonroad_sumo_nd_patch()
+        apply_commonroad_sumo_lane_grouping_patch()
         apply_commonroad_sumo_traffic_light_patch()
         cr2sumo_converter = CR2SumoMapConverter(self.scenario_model.get_current_scenario())
         conversion_succesful = cr2sumo_converter.create_sumo_files(Path(directory))

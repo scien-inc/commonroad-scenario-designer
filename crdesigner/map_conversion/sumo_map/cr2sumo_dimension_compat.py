@@ -11,6 +11,8 @@ _PATCH_FLAG = "_crdesigner_nd_patch_applied"
 _PATCHED_ONCE = False
 _TL_PATCH_FLAG = "_crdesigner_tl_patch_applied"
 _TL_PATCHED_ONCE = False
+_LANE_GROUP_PATCH_FLAG = "_crdesigner_lane_group_patch_applied"
+_LANE_GROUP_PATCHED_ONCE = False
 
 
 def _vertex_dimension(vertices: np.ndarray) -> int:
@@ -224,6 +226,154 @@ def _empty_container_like(values):
     if isinstance(values, set):
         return set()
     return set()
+
+
+def _normalized_member_values(values) -> tuple[str, ...]:
+    if not values:
+        return tuple()
+    return tuple(sorted(str(getattr(value, "value", value)) for value in values))
+
+
+def _lanelet_compatibility_signature(lanelet) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """
+    Build a stable compatibility signature for grouping lanelets into SUMO edges.
+
+    The signature intentionally includes lanelet type and user permissions so lanelets with
+    incompatible semantics (e.g. urban + bicycleLane) are not merged into one SUMO edge.
+    """
+    lanelet_types = _normalized_member_values(getattr(lanelet, "lanelet_type", tuple()))
+    user_one_way = _normalized_member_values(getattr(lanelet, "user_one_way", tuple()))
+    user_bidirectional = _normalized_member_values(
+        getattr(lanelet, "user_bidirectional", tuple())
+    )
+    return lanelet_types, user_one_way, user_bidirectional
+
+
+def _split_lanelet_ids_by_compatibility(lanelet_network, lanelet_ids: list[int]) -> list[list[int]]:
+    """
+    Split an ordered lanelet-id list into contiguous segments with equal compatibility signatures.
+    """
+    if not lanelet_ids:
+        return []
+
+    segments: list[list[int]] = []
+    current_segment: list[int] = []
+    current_signature = None
+
+    for lanelet_id in lanelet_ids:
+        lanelet = lanelet_network.find_lanelet_by_id(lanelet_id)
+        if lanelet is None:
+            raise RuntimeError(
+                f"Cannot split lanelet compatibility groups: lanelet {lanelet_id} does not exist."
+            )
+        signature = _lanelet_compatibility_signature(lanelet)
+
+        if current_signature is None or signature == current_signature:
+            current_segment.append(lanelet_id)
+            current_signature = signature
+            continue
+
+        segments.append(current_segment)
+        current_segment = [lanelet_id]
+        current_signature = signature
+
+    if current_segment:
+        segments.append(current_segment)
+
+    return segments
+
+
+def _needs_lane_grouping_patch(lanelets_module) -> bool:
+    """Return True if installed commonroad_sumo still groups mixed lanelet semantics into one edge."""
+    try:
+        source = inspect.getsource(lanelets_module.partition_lanelet_network_into_edges_and_lanes)
+    except (OSError, TypeError):
+        return True
+
+    if _LANE_GROUP_PATCH_FLAG in source:
+        return False
+
+    # Upstream fixed implementations should include semantics-aware splitting logic.
+    expected_tokens = ("lanelet_type", "user_one_way", "user_bidirectional")
+    return not all(token in source for token in expected_tokens)
+
+
+def apply_commonroad_sumo_lane_grouping_patch() -> bool:
+    """
+    Patch commonroad_sumo lanelet grouping so mixed lane semantics are split into separate SUMO edges.
+
+    Returns:
+        True if patching was applied during this call, False otherwise.
+    """
+    global _LANE_GROUP_PATCHED_ONCE
+
+    if _LANE_GROUP_PATCHED_ONCE:
+        return False
+
+    try:
+        from commonroad_sumo.cr2sumo.map_converter import lanelets as cr2sumo_lanelets
+        from commonroad_sumo.cr2sumo import map_converter as cr2sumo_map_converter_package
+        from commonroad_sumo.cr2sumo.map_converter import (
+            map_converter as cr2sumo_map_converter_module,
+        )
+    except ImportError:
+        _LOGGER.debug(
+            "commonroad_sumo is not available; skipping CR->SUMO lane-group compatibility patch."
+        )
+        return False
+
+    if getattr(cr2sumo_lanelets, _LANE_GROUP_PATCH_FLAG, False):
+        _LANE_GROUP_PATCHED_ONCE = True
+        return False
+
+    if not _needs_lane_grouping_patch(cr2sumo_lanelets):
+        setattr(cr2sumo_lanelets, _LANE_GROUP_PATCH_FLAG, True)
+        _LANE_GROUP_PATCHED_ONCE = True
+        _LOGGER.debug(
+            "commonroad_sumo lane grouping already appears compatibility-aware; no patch needed."
+        )
+        return False
+
+    original_partition = cr2sumo_lanelets.partition_lanelet_network_into_edges_and_lanes
+
+    def partition_lanelet_network_into_edges_and_lanes_compatible(lanelet_network):
+        lanelet_ids_by_edge_ids = original_partition(lanelet_network)
+        split_lanelet_ids_by_edge_ids = {}
+        num_splits = 0
+
+        for _edge_id, lanelet_ids in lanelet_ids_by_edge_ids.items():
+            segments = _split_lanelet_ids_by_compatibility(lanelet_network, lanelet_ids)
+            if len(segments) > 1:
+                num_splits += len(segments) - 1
+
+            for segment in segments:
+                # Keep right-most lanelet id as edge-id key for each contiguous segment.
+                split_lanelet_ids_by_edge_ids[segment[0]] = segment
+
+        if num_splits:
+            _LOGGER.info(
+                "Split %d mixed lanelet groups into compatibility-homogeneous SUMO edges.",
+                num_splits,
+            )
+
+        return split_lanelet_ids_by_edge_ids
+
+    cr2sumo_lanelets.partition_lanelet_network_into_edges_and_lanes = (
+        partition_lanelet_network_into_edges_and_lanes_compatible
+    )
+    cr2sumo_map_converter_package.partition_lanelet_network_into_edges_and_lanes = (
+        partition_lanelet_network_into_edges_and_lanes_compatible
+    )
+    cr2sumo_map_converter_module.partition_lanelet_network_into_edges_and_lanes = (
+        partition_lanelet_network_into_edges_and_lanes_compatible
+    )
+    cr2sumo_lanelets._crdesigner_original_partition_lanelet_network_into_edges_and_lanes = (
+        original_partition
+    )
+    setattr(cr2sumo_lanelets, _LANE_GROUP_PATCH_FLAG, True)
+    _LANE_GROUP_PATCHED_ONCE = True
+    _LOGGER.info("Applied commonroad_sumo CR->SUMO lane grouping compatibility patch.")
+    return True
 
 
 def _collect_reachable_new_edge_ids(start_edges, new_edge_ids, next_attr: str) -> set[int]:
