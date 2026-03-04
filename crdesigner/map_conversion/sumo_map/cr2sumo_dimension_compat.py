@@ -169,7 +169,12 @@ def apply_commonroad_sumo_nd_patch() -> bool:
                 [lanelet_obj.center_vertices]
             )
 
-        if np.min(np.linalg.norm(lanelet.left_vertices - lanelet.right_vertices, axis=1)) > radius:
+        # Require enough room on both sides before width erosion:
+        # left/right boundaries are each moved by `radius`, so at least `2 * radius`
+        # lane width is needed to avoid collapsing thin lanelets.
+        if np.min(np.linalg.norm(lanelet.left_vertices - lanelet.right_vertices, axis=1)) > (
+            2.0 * radius
+        ):
             left = lanelet.center_vertices - lanelet.left_vertices
             lanelet._left_vertices += left / np.linalg.norm(left, axis=1)[np.newaxis].T * radius
             right = lanelet.center_vertices - lanelet.right_vertices
@@ -221,6 +226,56 @@ def _empty_container_like(values):
     return set()
 
 
+def _collect_reachable_new_edge_ids(start_edges, new_edge_ids, next_attr: str) -> set[int]:
+    """Traverse edge graph and collect reachable edge IDs that survived in new_edges."""
+    queue = list(start_edges)
+    visited = set()
+    reachable_new_edge_ids = set()
+
+    while queue:
+        current = queue.pop()
+        current_id = getattr(current, "id", None)
+        if current_id is None or current_id in visited:
+            continue
+        visited.add(current_id)
+
+        if current_id in new_edge_ids:
+            reachable_new_edge_ids.add(current_id)
+            continue
+
+        queue.extend(getattr(current, next_attr, []))
+
+    return reachable_new_edge_ids
+
+
+def _find_unique_upstream_replacement_edge_id(
+    converter, removed_edge_id: int, new_edge_ids: set[int] | None = None
+) -> int | None:
+    """
+    Find a unique surviving edge upstream of a removed edge.
+
+    Returns:
+        Surviving edge ID if exactly one upstream candidate exists, otherwise None.
+    """
+    removed_edge = converter.edges.get(removed_edge_id)
+    if removed_edge is None:
+        return None
+
+    if new_edge_ids is None:
+        new_edge_ids = set(converter.new_edges.keys())
+
+    reachable_upstream_new_edges = _collect_reachable_new_edge_ids(
+        start_edges=getattr(removed_edge, "incoming", []),
+        new_edge_ids=new_edge_ids,
+        next_attr="incoming",
+    )
+
+    if len(reachable_upstream_new_edges) != 1:
+        return None
+
+    return next(iter(reachable_upstream_new_edges))
+
+
 def apply_commonroad_sumo_traffic_light_patch() -> bool:
     """
     Patch commonroad_sumo CR->SUMO traffic-light conversion to tolerate ambiguous lanelet successors.
@@ -262,27 +317,76 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
 
     def create_traffic_lights_safe(self):
         incoming_lanelet_2_intersection = self._lanelet_network.map_inc_lanelets_to_intersections
+        new_edge_ids = set(self.new_edges.keys())
         temporarily_disabled = []
+        temporarily_remapped_lanelet_edges = []
+        ambiguous_lanelet_ids = []
+        removed_lanelet_ids_no_unique_upstream = []
+        skipped_ambiguous_successor = 0
+        remapped_removed_edges = 0
+        skipped_removed_edge_no_unique_upstream = 0
 
         for lanelet in self._lanelet_network.lanelets:
             if not lanelet.traffic_lights:
                 continue
-            if lanelet.lanelet_id in incoming_lanelet_2_intersection:
-                continue
-            if len(lanelet.successor) == 1:
+
+            # Keep existing safeguard: skip lanelets where direction->connection mapping is undefined.
+            if (
+                lanelet.lanelet_id not in incoming_lanelet_2_intersection
+                and len(lanelet.successor) != 1
+            ):
+                original_lights = lanelet.traffic_lights
+                temporarily_disabled.append((lanelet, original_lights))
+                lanelet.traffic_lights = _empty_container_like(original_lights)
+                skipped_ambiguous_successor += 1
+                ambiguous_lanelet_ids.append(str(lanelet.lanelet_id))
                 continue
 
-            original_lights = lanelet.traffic_lights
-            temporarily_disabled.append((lanelet, original_lights))
-            lanelet.traffic_lights = _empty_container_like(original_lights)
+            lanelet_edge_id = self.lanelet_id2edge_id.get(lanelet.lanelet_id)
+            if lanelet_edge_id is None:
+                original_lights = lanelet.traffic_lights
+                temporarily_disabled.append((lanelet, original_lights))
+                lanelet.traffic_lights = _empty_container_like(original_lights)
+                skipped_removed_edge_no_unique_upstream += 1
+                removed_lanelet_ids_no_unique_upstream.append(str(lanelet.lanelet_id))
+                continue
 
-        if temporarily_disabled:
-            sample_ids = [str(la.lanelet_id) for la, _ in temporarily_disabled[:10]]
+            if lanelet_edge_id not in self.new_edges:
+                replacement_edge_id = _find_unique_upstream_replacement_edge_id(
+                    self, lanelet_edge_id, new_edge_ids
+                )
+                if replacement_edge_id is None:
+                    original_lights = lanelet.traffic_lights
+                    temporarily_disabled.append((lanelet, original_lights))
+                    lanelet.traffic_lights = _empty_container_like(original_lights)
+                    skipped_removed_edge_no_unique_upstream += 1
+                    removed_lanelet_ids_no_unique_upstream.append(str(lanelet.lanelet_id))
+                    continue
+
+                temporarily_remapped_lanelet_edges.append((lanelet.lanelet_id, lanelet_edge_id))
+                self.lanelet_id2edge_id[lanelet.lanelet_id] = replacement_edge_id
+                remapped_removed_edges += 1
+
+        if skipped_ambiguous_successor:
             _LOGGER.warning(
                 "Skipping traffic-light encoding on %d lanelets with ambiguous successors "
                 "(no intersection mapping and successor count != 1). Example lanelet ids: %s",
-                len(temporarily_disabled),
-                ", ".join(sample_ids),
+                skipped_ambiguous_successor,
+                ", ".join(ambiguous_lanelet_ids[:10]),
+            )
+
+        if remapped_removed_edges:
+            _LOGGER.info(
+                "Remapped traffic-light lanelets from removed edges to unique upstream surviving edges: %d",
+                remapped_removed_edges,
+            )
+
+        if skipped_removed_edge_no_unique_upstream:
+            _LOGGER.warning(
+                "Skipped traffic-light encoding on %d lanelets whose edge was removed and had no "
+                "unique upstream surviving replacement. Example lanelet ids: %s",
+                skipped_removed_edge_no_unique_upstream,
+                ", ".join(removed_lanelet_ids_no_unique_upstream[:10]),
             )
 
         try:
@@ -290,6 +394,8 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
         finally:
             for lanelet, original_lights in temporarily_disabled:
                 lanelet.traffic_lights = original_lights
+            for lanelet_id, original_edge_id in temporarily_remapped_lanelet_edges:
+                self.lanelet_id2edge_id[lanelet_id] = original_edge_id
 
     CR2SumoMapConverter._create_traffic_lights = create_traffic_lights_safe
     cr2sumo_map_converter._crdesigner_original_create_traffic_lights = original_create_traffic_lights
