@@ -224,8 +224,26 @@ def sumocr(ctx: typer.Context):
 
 
 @cli.command()
-def crsumo(ctx: typer.Context):
-    commonroad_to_sumo(ctx.obj["input_file"], ctx.obj["output_file"])
+def crsumo(
+    ctx: typer.Context,
+    z_mode: Annotated[
+        str,
+        typer.Option(help="z-axis handling mode: 'preserve' or 'force-2d'"),
+    ] = "preserve",
+    fallback_2d: Annotated[
+        bool,
+        typer.Option(
+            "--fallback-2d/--no-fallback-2d",
+            help="Retry once in 2D mode if z preserving conversion fails",
+        ),
+    ] = True,
+):
+    commonroad_to_sumo(
+        ctx.obj["input_file"],
+        ctx.obj["output_file"],
+        z_mode=z_mode,
+        fallback_2d=fallback_2d,
+    )
 
 
 @cli.command()

@@ -28,6 +28,10 @@ from crdesigner.map_conversion.osm2cr.converter_modules.converter import GraphSc
 from crdesigner.map_conversion.osm2cr.converter_modules.cr_operations.export import (
     convert_to_scenario,
 )
+from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
+    apply_commonroad_sumo_nd_patch,
+    apply_commonroad_sumo_traffic_light_patch,
+)
 from crdesigner.map_conversion.sumo_map.sumo2cr import convert_net_to_cr
 
 Path_T = Union[str, Path]
@@ -115,18 +119,66 @@ def sumo_to_commonroad(input_file: Path_T) -> Scenario:
     return convert_net_to_cr(str(input_file))
 
 
-def commonroad_to_sumo(input_file: Path_T, output_file: Path_T):
+def _create_2d_scenario_for_sumo(input_file: Path_T) -> Scenario:
+    """Read a scenario file and convert it to 2D while preserving map name."""
+    scenario, _ = CRDesignerFileReader(input_file).open()
+    map_name = scenario.scenario_id.map_name
+    scenario.convert_to_2d(map_name=map_name)
+    return scenario
+
+
+def commonroad_to_sumo(
+    input_file: Path_T,
+    output_file: Path_T,
+    z_mode: str = "preserve",
+    fallback_2d: bool = True,
+):
     """
     Converts CommonRoad file to SUMO net file and stores it
 
     :param input_file: Path to CommonRoad file
     :param output_file: Path where files should be stored
+    :param z_mode: 'preserve' keeps z values, 'force-2d' drops z values before conversion
+    :param fallback_2d: If True and z preserving conversion fails, retry once after 2D conversion
     :return: CommonRoad scenario
     """
+    valid_z_modes = {"preserve", "force-2d"}
+    if z_mode not in valid_z_modes:
+        raise ValueError(f"Invalid z_mode='{z_mode}'. Expected one of {sorted(valid_z_modes)}.")
 
     path, _ = os.path.split(output_file)
-    converter = CR2SumoMapConverter.from_file(input_file)
-    converter.create_sumo_files(Path(path))
+    output_dir = Path(path)
+
+    if z_mode == "force-2d":
+        logging.info("CR->SUMO conversion started with z_mode='force-2d'.")
+        apply_commonroad_sumo_traffic_light_patch()
+        scenario_2d = _create_2d_scenario_for_sumo(input_file)
+        converter = CR2SumoMapConverter(scenario_2d)
+        converter.create_sumo_files(output_dir)
+        logging.info("CR->SUMO conversion finished in forced 2D mode.")
+        return
+
+    apply_commonroad_sumo_nd_patch()
+    apply_commonroad_sumo_traffic_light_patch()
+
+    try:
+        converter = CR2SumoMapConverter.from_file(input_file)
+        converter.create_sumo_files(output_dir)
+        logging.info("CR->SUMO conversion finished with z preservation enabled.")
+    except Exception as err:
+        if not fallback_2d:
+            logging.error(
+                "CR->SUMO conversion failed with z preservation and fallback_2d disabled."
+            )
+            raise
+        logging.warning(
+            "CR->SUMO conversion failed with z preservation (%s). Retrying once in 2D mode.",
+            err,
+        )
+        scenario_2d = _create_2d_scenario_for_sumo(input_file)
+        converter = CR2SumoMapConverter(scenario_2d)
+        converter.create_sumo_files(output_dir)
+        logging.info("CR->SUMO conversion succeeded after 2D fallback retry.")
 
 
 def osm_to_commonroad(input_file: Path_T) -> Scenario:

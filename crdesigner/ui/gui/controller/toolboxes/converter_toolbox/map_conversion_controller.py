@@ -32,6 +32,10 @@ from crdesigner.map_conversion.osm2cr.converter_modules.graph_operations.road_gr
 from crdesigner.map_conversion.osm2cr.converter_modules.osm_operations.downloader import (
     download_around_map,
 )
+from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
+    apply_commonroad_sumo_nd_patch,
+    apply_commonroad_sumo_traffic_light_patch,
+)
 from crdesigner.map_conversion.sumo_map.sumo2cr import convert_net_to_cr
 from crdesigner.ui.gui.model.scenario_model import ScenarioModel
 from crdesigner.ui.gui.utilities.util import select_local_file
@@ -515,6 +519,8 @@ class MapConversionToolboxController(QDockWidget):
         if not directory:
             return
 
+        apply_commonroad_sumo_nd_patch()
+        apply_commonroad_sumo_traffic_light_patch()
         cr2sumo_converter = CR2SumoMapConverter(self.scenario_model.get_current_scenario())
         conversion_succesful = cr2sumo_converter.create_sumo_files(Path(directory))
         if not conversion_succesful:

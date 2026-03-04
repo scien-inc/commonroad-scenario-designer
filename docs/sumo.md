@@ -16,6 +16,25 @@ For the relevant command line commands execute
 Tutorials on how to use the Python APIs can be found in our
 [GitHub repository](https://github.com/CommonRoad/commonroad-scenario-designer/tree/develop/tutorials/conversion_examples).
 
+### CR to SUMO z-axis handling
+
+The `crsumo` command supports explicit z-axis handling modes:
+
+```bash
+# Default: preserve z if possible, retry once in 2D on failure
+crdesigner --input-file /path/map.xml --output-file /path/out/_placeholder.net.xml \
+  crsumo --z-mode preserve --fallback-2d
+
+# Force conversion to 2D before CR->SUMO conversion
+crdesigner --input-file /path/map.xml --output-file /path/out/_placeholder.net.xml \
+  crsumo --z-mode force-2d --no-fallback-2d
+```
+
+For robustness, CR->SUMO conversion now also applies a compatibility safeguard for traffic-light
+encoding: lanelets with traffic lights but ambiguous successor topology
+(`no intersection mapping` and `successor count != 1`) are skipped during traffic-light encoding
+instead of aborting the full conversion.
+
 
 ## Implementation Details
 In SUMO, nodes represent ends of edges or other fixed position objects (eg. traffic signs) and are connected by edges.
