@@ -5,6 +5,7 @@ import numpy as np
 
 from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
     apply_commonroad_sumo_nd_patch,
+    apply_commonroad_sumo_traffic_light_patch,
 )
 
 
@@ -50,3 +51,7 @@ class TestCR2SumoDimensionCompat(unittest.TestCase):
         # Already applied in setUpClass.
         self.assertFalse(apply_commonroad_sumo_nd_patch())
         self.assertFalse(apply_commonroad_sumo_nd_patch())
+
+    def test_apply_traffic_light_patch_is_idempotent(self):
+        apply_commonroad_sumo_traffic_light_patch()
+        self.assertFalse(apply_commonroad_sumo_traffic_light_patch())

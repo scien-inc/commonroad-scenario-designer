@@ -30,6 +30,11 @@ crdesigner --input-file /path/map.xml --output-file /path/out/_placeholder.net.x
   crsumo --z-mode force-2d --no-fallback-2d
 ```
 
+For robustness, CR->SUMO conversion now also applies a compatibility safeguard for traffic-light
+encoding: lanelets with traffic lights but ambiguous successor topology
+(`no intersection mapping` and `successor count != 1`) are skipped during traffic-light encoding
+instead of aborting the full conversion.
+
 
 ## Implementation Details
 In SUMO, nodes represent ends of edges or other fixed position objects (eg. traffic signs) and are connected by edges.

@@ -30,6 +30,7 @@ from crdesigner.map_conversion.osm2cr.converter_modules.cr_operations.export imp
 )
 from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
     apply_commonroad_sumo_nd_patch,
+    apply_commonroad_sumo_traffic_light_patch,
 )
 from crdesigner.map_conversion.sumo_map.sumo2cr import convert_net_to_cr
 
@@ -150,6 +151,7 @@ def commonroad_to_sumo(
 
     if z_mode == "force-2d":
         logging.info("CR->SUMO conversion started with z_mode='force-2d'.")
+        apply_commonroad_sumo_traffic_light_patch()
         scenario_2d = _create_2d_scenario_for_sumo(input_file)
         converter = CR2SumoMapConverter(scenario_2d)
         converter.create_sumo_files(output_dir)
@@ -157,6 +159,7 @@ def commonroad_to_sumo(
         return
 
     apply_commonroad_sumo_nd_patch()
+    apply_commonroad_sumo_traffic_light_patch()
 
     try:
         converter = CR2SumoMapConverter.from_file(input_file)

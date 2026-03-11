@@ -132,6 +132,10 @@ crdesigner --input-file /path/map.xml --output-file /path/out/_placeholder.net.x
   crsumo --z-mode force-2d --no-fallback-2d
 ```
 
+During CR->SUMO conversion, ambiguous traffic-light lanelets
+(`no intersection mapping` and `successor count != 1`) are skipped during
+traffic-light encoding to prevent full conversion failure.
+
 ### Map Converters
 You can execute the different converters either via command line, calling them within your Python program via an API,
 or the GUI.

@@ -9,6 +9,8 @@ _LOGGER = logging.getLogger(__name__)
 
 _PATCH_FLAG = "_crdesigner_nd_patch_applied"
 _PATCHED_ONCE = False
+_TL_PATCH_FLAG = "_crdesigner_tl_patch_applied"
+_TL_PATCHED_ONCE = False
 
 
 def _vertex_dimension(vertices: np.ndarray) -> int:
@@ -192,4 +194,106 @@ def apply_commonroad_sumo_nd_patch() -> bool:
 
     _PATCHED_ONCE = True
     _LOGGER.info("Applied commonroad_sumo CR->SUMO ND compatibility patch.")
+    return True
+
+
+def _needs_traffic_light_patch() -> bool:
+    """Return True if installed commonroad_sumo still raises on ambiguous traffic-light lanelets."""
+    try:
+        from commonroad_sumo.cr2sumo.map_converter.map_converter import CR2SumoMapConverter
+
+        source = inspect.getsource(CR2SumoMapConverter._create_traffic_lights)
+    except (ImportError, OSError, TypeError):
+        # Source inspection can fail for optimized/packaged functions.
+        return True
+
+    # Upstream implementation raises ValueError inside calc_direction_2_connections.
+    return "calc_direction_2_connections" in source and "raise ValueError" in source
+
+
+def _empty_container_like(values):
+    if isinstance(values, list):
+        return []
+    if isinstance(values, tuple):
+        return tuple()
+    if isinstance(values, set):
+        return set()
+    return set()
+
+
+def apply_commonroad_sumo_traffic_light_patch() -> bool:
+    """
+    Patch commonroad_sumo CR->SUMO traffic-light conversion to tolerate ambiguous lanelet successors.
+
+    The upstream converter can raise ValueError when a traffic-light lanelet is not mapped to an
+    intersection and does not have exactly one successor. We skip such lanelets during traffic-light
+    encoding instead of aborting the whole map conversion.
+
+    Returns:
+        True if patching was applied during this call, False otherwise.
+    """
+    global _TL_PATCHED_ONCE
+
+    if _TL_PATCHED_ONCE:
+        return False
+
+    try:
+        from commonroad_sumo.cr2sumo.map_converter import map_converter as cr2sumo_map_converter
+        from commonroad_sumo.cr2sumo.map_converter.map_converter import CR2SumoMapConverter
+    except ImportError:
+        _LOGGER.debug(
+            "commonroad_sumo is not available; skipping CR->SUMO traffic-light compatibility patch."
+        )
+        return False
+
+    if getattr(cr2sumo_map_converter, _TL_PATCH_FLAG, False):
+        _TL_PATCHED_ONCE = True
+        return False
+
+    if not _needs_traffic_light_patch():
+        setattr(cr2sumo_map_converter, _TL_PATCH_FLAG, True)
+        _TL_PATCHED_ONCE = True
+        _LOGGER.debug(
+            "commonroad_sumo traffic-light conversion already handles ambiguous successors; no patch needed."
+        )
+        return False
+
+    original_create_traffic_lights = CR2SumoMapConverter._create_traffic_lights
+
+    def create_traffic_lights_safe(self):
+        incoming_lanelet_2_intersection = self._lanelet_network.map_inc_lanelets_to_intersections
+        temporarily_disabled = []
+
+        for lanelet in self._lanelet_network.lanelets:
+            if not lanelet.traffic_lights:
+                continue
+            if lanelet.lanelet_id in incoming_lanelet_2_intersection:
+                continue
+            if len(lanelet.successor) == 1:
+                continue
+
+            original_lights = lanelet.traffic_lights
+            temporarily_disabled.append((lanelet, original_lights))
+            lanelet.traffic_lights = _empty_container_like(original_lights)
+
+        if temporarily_disabled:
+            sample_ids = [str(la.lanelet_id) for la, _ in temporarily_disabled[:10]]
+            _LOGGER.warning(
+                "Skipping traffic-light encoding on %d lanelets with ambiguous successors "
+                "(no intersection mapping and successor count != 1). Example lanelet ids: %s",
+                len(temporarily_disabled),
+                ", ".join(sample_ids),
+            )
+
+        try:
+            return original_create_traffic_lights(self)
+        finally:
+            for lanelet, original_lights in temporarily_disabled:
+                lanelet.traffic_lights = original_lights
+
+    CR2SumoMapConverter._create_traffic_lights = create_traffic_lights_safe
+    cr2sumo_map_converter._crdesigner_original_create_traffic_lights = original_create_traffic_lights
+    setattr(cr2sumo_map_converter, _TL_PATCH_FLAG, True)
+    _TL_PATCHED_ONCE = True
+    _LOGGER.info("Applied commonroad_sumo CR->SUMO traffic-light compatibility patch.")
     return True
