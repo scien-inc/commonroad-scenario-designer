@@ -14,6 +14,7 @@ from crdesigner.common.file_writer import CRDesignerFileWriter, OverwriteExistin
 from crdesigner.map_conversion.map_conversion_interface import (
     commonroad_to_lanelet,
     commonroad_to_sumo,
+    filter_commonroad_traffic_lights_from_crsumo_log,
     lanelet_to_commonroad,
     opendrive_to_commonroad,
     opendrive_to_lanelet,
@@ -243,6 +244,36 @@ def crsumo(
         ctx.obj["output_file"],
         z_mode=z_mode,
         fallback_2d=fallback_2d,
+    )
+
+
+@cli.command()
+def crsumo_tl_filter(
+    ctx: typer.Context,
+    classification_log: Annotated[
+        Path,
+        typer.Option(
+            ...,
+            help="CR->SUMO conversion log with detailed 'Traffic-light classification record' entries",
+        ),
+    ],
+    include_partially_lost: Annotated[
+        bool,
+        typer.Option(
+            "--include-partially-lost/--exclude-partially-lost",
+            help="Also retain traffic lights that are only partially lost during CR->SUMO conversion",
+        ),
+    ] = False,
+    report_file: Annotated[
+        Optional[Path], typer.Option(help="Optional JSON report output path")
+    ] = None,
+):
+    filter_commonroad_traffic_lights_from_crsumo_log(
+        ctx.obj["input_file"],
+        ctx.obj["output_file"],
+        classification_log,
+        include_partially_lost=include_partially_lost,
+        report_file=report_file,
     )
 
 

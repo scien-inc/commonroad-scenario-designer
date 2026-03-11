@@ -1,11 +1,15 @@
 import importlib.util
+import logging
 import unittest
 
 import numpy as np
 
 from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
+    _build_traffic_light_classification_record,
     _find_unique_upstream_replacement_edge_id,
+    _log_traffic_light_classification_records,
     _split_lanelet_ids_by_compatibility,
+    _summarize_traffic_light_classification_records,
     apply_commonroad_sumo_lane_grouping_patch,
     apply_commonroad_sumo_nd_patch,
     apply_commonroad_sumo_traffic_light_patch,
@@ -25,6 +29,8 @@ class TestCR2SumoDimensionCompat(unittest.TestCase):
             lanelet_type=None,
             user_one_way=None,
             user_bidirectional=None,
+            traffic_lights=None,
+            successor=None,
         ):
             self.lanelet_id = lanelet_id
             self.lanelet_type = lanelet_type if lanelet_type is not None else set()
@@ -32,6 +38,8 @@ class TestCR2SumoDimensionCompat(unittest.TestCase):
             self.user_bidirectional = (
                 user_bidirectional if user_bidirectional is not None else set()
             )
+            self.traffic_lights = traffic_lights if traffic_lights is not None else set()
+            self.successor = successor if successor is not None else []
 
     class _FakeLaneletNetwork:
         def __init__(self, lanelets):
@@ -144,6 +152,79 @@ class TestCR2SumoDimensionCompat(unittest.TestCase):
 
         segments = _split_lanelet_ids_by_compatibility(lanelet_network, [1, 2, 3])
         self.assertEqual([[1], [2], [3]], segments)
+
+    def test_build_traffic_light_classification_record_normalizes_ids(self):
+        lanelet = self._FakeLanelet(177, traffic_lights={6455, 6454}, successor=[301, 300])
+
+        record = _build_traffic_light_classification_record(
+            "remapped",
+            lanelet,
+            edge_id=210,
+            replacement_edge_id=110,
+            has_intersection_mapping=False,
+            note="test",
+        )
+
+        self.assertEqual("remapped", record["category"])
+        self.assertEqual(177, record["lanelet_id"])
+        self.assertEqual([6454, 6455], record["traffic_light_ids"])
+        self.assertEqual([300, 301], record["successor_ids"])
+        self.assertEqual(210, record["edge_id"])
+        self.assertEqual(110, record["replacement_edge_id"])
+        self.assertFalse(record["has_intersection_mapping"])
+        self.assertEqual("test", record["note"])
+
+    def test_build_traffic_light_classification_record_can_override_traffic_light_ids(self):
+        lanelet = self._FakeLanelet(177, traffic_lights=set(), successor=[301, 300])
+
+        record = _build_traffic_light_classification_record(
+            "skipped_ambiguous",
+            lanelet,
+            traffic_light_ids={6455, 6454},
+            note="captured before temporary disable",
+        )
+
+        self.assertEqual([6454, 6455], record["traffic_light_ids"])
+        self.assertEqual([300, 301], record["successor_ids"])
+        self.assertEqual("captured before temporary disable", record["note"])
+
+    def test_summarize_traffic_light_classification_records_counts_unique_ids(self):
+        records_by_category = {
+            "normal": [
+                {"lanelet_id": 1, "traffic_light_ids": [10, 11]},
+                {"lanelet_id": 2, "traffic_light_ids": [11]},
+            ],
+            "remapped": [{"lanelet_id": 3, "traffic_light_ids": [12]}],
+            "skipped_ambiguous": [],
+            "skipped_removed_no_unique_upstream": [{"lanelet_id": 4, "traffic_light_ids": [13]}],
+        }
+
+        summary = _summarize_traffic_light_classification_records(records_by_category)
+
+        self.assertEqual(2, summary["normal"]["lanelet_count"])
+        self.assertEqual(2, summary["normal"]["unique_traffic_light_count"])
+        self.assertEqual(1, summary["remapped"]["lanelet_count"])
+        self.assertEqual(1, summary["skipped_removed_no_unique_upstream"]["unique_traffic_light_count"])
+
+    def test_log_traffic_light_classification_records_emits_summary_and_records(self):
+        records_by_category = {
+            "normal": [{"category": "normal", "lanelet_id": 1, "traffic_light_ids": [10]}],
+            "remapped": [],
+            "skipped_ambiguous": [
+                {"category": "skipped_ambiguous", "lanelet_id": 2, "traffic_light_ids": [11]}
+            ],
+            "skipped_removed_no_unique_upstream": [],
+        }
+
+        with self.assertLogs(
+            "crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat", level=logging.INFO
+        ) as captured:
+            _log_traffic_light_classification_records(records_by_category)
+
+        output = "\n".join(captured.output)
+        self.assertIn("Traffic-light classification summary", output)
+        self.assertIn('"category": "normal"', output)
+        self.assertIn('"category": "skipped_ambiguous"', output)
 
     def test_find_unique_upstream_replacement_edge_id_unique(self):
         e1 = self._FakeEdge(1)

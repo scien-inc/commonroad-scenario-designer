@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 from crdesigner.map_conversion import map_conversion_interface
@@ -130,3 +131,89 @@ class TestCommonRoadToSumoInterface(unittest.TestCase):
                 z_mode="invalid",
                 fallback_2d=True,
             )
+
+    def test_filter_commonroad_traffic_lights_from_crsumo_log_disappeared_only(self):
+        log_text = "\n".join(
+            [
+                'INFO - Traffic-light classification record: {"category":"normal","lanelet_id":1,"traffic_light_ids":[10]}',
+                'WARNING - Traffic-light classification record: {"category":"skipped_ambiguous","lanelet_id":2,"traffic_light_ids":[11]}',
+                'WARNING - Traffic-light classification record: {"category":"skipped_removed_no_unique_upstream","lanelet_id":3,"traffic_light_ids":[12]}',
+            ]
+        )
+
+        fake_lanelet_network = MagicMock()
+        fake_lanelet_network.traffic_lights = [
+            MagicMock(traffic_light_id=10),
+            MagicMock(traffic_light_id=11),
+            MagicMock(traffic_light_id=12),
+            MagicMock(traffic_light_id=13),
+        ]
+        fake_scenario = MagicMock(lanelet_network=fake_lanelet_network)
+        fake_pp = MagicMock()
+        reader_instance = MagicMock()
+        reader_instance.open.return_value = (fake_scenario, fake_pp)
+        writer_instance = MagicMock()
+
+        with TemporaryDirectory() as tmp_dir, patch.object(
+            map_conversion_interface, "CRDesignerFileReader", return_value=reader_instance
+        ), patch.object(
+            map_conversion_interface, "CRDesignerFileWriter", return_value=writer_instance
+        ):
+            log_path = Path(tmp_dir) / "conversion.log"
+            report_path = Path(tmp_dir) / "report.json"
+            log_path.write_text(log_text, encoding="utf-8")
+
+            map_conversion_interface.filter_commonroad_traffic_lights_from_crsumo_log(
+                "in.xml",
+                "/tmp/out/disappeared_only.xml",
+                log_path,
+                include_partially_lost=False,
+                report_file=report_path,
+            )
+
+            self.assertTrue(report_path.exists())
+
+        fake_lanelet_network.remove_traffic_light.assert_any_call(10)
+        fake_lanelet_network.remove_traffic_light.assert_any_call(13)
+        removed_ids = {call.args[0] for call in fake_lanelet_network.remove_traffic_light.call_args_list}
+        self.assertNotIn(11, removed_ids)
+        self.assertNotIn(12, removed_ids)
+        fake_lanelet_network.cleanup_traffic_light_references.assert_called_once()
+        writer_instance.write_to_file.assert_called_once()
+
+    def test_filter_commonroad_traffic_lights_from_crsumo_log_can_include_partially_lost(self):
+        log_text = "\n".join(
+            [
+                'INFO - Traffic-light classification record: {"category":"normal","lanelet_id":1,"traffic_light_ids":[10]}',
+                'WARNING - Traffic-light classification record: {"category":"skipped_ambiguous","lanelet_id":2,"traffic_light_ids":[10,11]}',
+            ]
+        )
+
+        fake_lanelet_network = MagicMock()
+        fake_lanelet_network.traffic_lights = [
+            MagicMock(traffic_light_id=10),
+            MagicMock(traffic_light_id=11),
+            MagicMock(traffic_light_id=12),
+        ]
+        fake_scenario = MagicMock(lanelet_network=fake_lanelet_network)
+        reader_instance = MagicMock()
+        reader_instance.open.return_value = (fake_scenario, MagicMock())
+        writer_instance = MagicMock()
+
+        with TemporaryDirectory() as tmp_dir, patch.object(
+            map_conversion_interface, "CRDesignerFileReader", return_value=reader_instance
+        ), patch.object(
+            map_conversion_interface, "CRDesignerFileWriter", return_value=writer_instance
+        ):
+            log_path = Path(tmp_dir) / "conversion.log"
+            log_path.write_text(log_text, encoding="utf-8")
+
+            map_conversion_interface.filter_commonroad_traffic_lights_from_crsumo_log(
+                "in.xml",
+                "/tmp/out/problematic.xml",
+                log_path,
+                include_partially_lost=True,
+            )
+
+        fake_lanelet_network.remove_traffic_light.assert_called_once_with(12)
+        fake_lanelet_network.cleanup_traffic_light_references.assert_called_once()

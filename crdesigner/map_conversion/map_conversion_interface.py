@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import subprocess
@@ -14,6 +15,7 @@ from crdesigner.common.config.general_config import general_config
 from crdesigner.common.config.lanelet2_config import lanelet2_config
 from crdesigner.common.config.opendrive_config import open_drive_config
 from crdesigner.common.file_reader import CRDesignerFileReader
+from crdesigner.common.file_writer import CRDesignerFileWriter, OverwriteExistingFile
 from crdesigner.map_conversion.lanelet2.cr2lanelet import CR2LaneletConverter
 from crdesigner.map_conversion.lanelet2.lanelet2_parser import Lanelet2Parser
 from crdesigner.map_conversion.lanelet2.lanelet2cr import Lanelet2CRConverter
@@ -33,9 +35,19 @@ from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
     apply_commonroad_sumo_nd_patch,
     apply_commonroad_sumo_traffic_light_patch,
 )
+from crdesigner.map_conversion.sumo_map.traffic_light_log_tools import (
+    load_traffic_light_classification_records_from_log,
+    summarize_traffic_light_classification_records,
+)
 from crdesigner.map_conversion.sumo_map.sumo2cr import convert_net_to_cr
 
 Path_T = Union[str, Path]
+
+
+def _log_identifier_sort_key(value):
+    if isinstance(value, int):
+        return (0, value)
+    return (1, str(value))
 
 
 def lanelet_to_commonroad(
@@ -182,6 +194,85 @@ def commonroad_to_sumo(
         converter = CR2SumoMapConverter(scenario_2d)
         converter.create_sumo_files(output_dir)
         logging.info("CR->SUMO conversion succeeded after 2D fallback retry.")
+
+
+def filter_commonroad_traffic_lights_from_crsumo_log(
+    input_file: Path_T,
+    output_file: Path_T,
+    classification_log_file: Path_T,
+    include_partially_lost: bool = False,
+    report_file: Path_T | None = None,
+):
+    """
+    Keep only the traffic lights selected from a CR->SUMO classification log and write a filtered CR file.
+
+    The classification log must contain detailed "Traffic-light classification record" JSON entries.
+    By default only traffic lights that disappear entirely during CR->SUMO conversion are retained.
+
+    :param input_file: Path to input CommonRoad file.
+    :param output_file: Path to filtered CommonRoad output file.
+    :param classification_log_file: Log file emitted by CR->SUMO conversion with detailed classification records.
+    :param include_partially_lost: If True, also retain traffic lights that are only partially lost.
+    :param report_file: Optional JSON report path.
+    """
+    records = load_traffic_light_classification_records_from_log(classification_log_file)
+    summary = summarize_traffic_light_classification_records(records)
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    keep_ids = set(summary["traffic_light_ids"]["disappeared_only"])
+    if include_partially_lost:
+        keep_ids.update(summary["traffic_light_ids"]["partially_lost"])
+
+    scenario, planning_problem_set = CRDesignerFileReader(input_file).open()
+    lanelet_network = scenario.lanelet_network
+    existing_traffic_light_ids = {
+        traffic_light.traffic_light_id for traffic_light in list(lanelet_network.traffic_lights)
+    }
+    removable_traffic_light_ids = existing_traffic_light_ids.difference(keep_ids)
+
+    for traffic_light_id in removable_traffic_light_ids:
+        lanelet_network.remove_traffic_light(traffic_light_id)
+    lanelet_network.cleanup_traffic_light_references()
+
+    CRDesignerFileWriter(scenario, planning_problem_set).write_to_file(
+        str(output_path), overwrite_existing_file=OverwriteExistingFile.ALWAYS
+    )
+
+    if report_file is not None:
+        report_path = Path(report_file)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(
+                {
+                    **summary,
+                    "selected_output_mode": (
+                        "disappeared_and_partially_lost"
+                        if include_partially_lost
+                        else "disappeared_only"
+                    ),
+                    "selected_traffic_light_ids": sorted(keep_ids, key=_log_identifier_sort_key),
+                    "selected_traffic_light_count": len(keep_ids),
+                },
+                ensure_ascii=True,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    logging.info(
+        "Wrote filtered CommonRoad file with %d selected traffic lights to %s.",
+        len(keep_ids),
+        output_path,
+    )
+    logging.info(
+        "Traffic-light log summary: disappeared_only=%d, partially_lost=%d, retained_only=%d.",
+        summary["traffic_light_counts"]["disappeared_only"],
+        summary["traffic_light_counts"]["partially_lost"],
+        summary["traffic_light_counts"]["retained_only"],
+    )
 
 
 def osm_to_commonroad(input_file: Path_T) -> Scenario:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 
 import numpy as np
@@ -226,6 +227,115 @@ def _empty_container_like(values):
     if isinstance(values, set):
         return set()
     return set()
+
+
+def _normalize_log_identifier(value):
+    if hasattr(value, "traffic_light_id"):
+        value = getattr(value, "traffic_light_id")
+    elif hasattr(value, "lanelet_id"):
+        value = getattr(value, "lanelet_id")
+    elif hasattr(value, "id"):
+        value = getattr(value, "id")
+    elif hasattr(value, "value"):
+        value = getattr(value, "value")
+
+    if isinstance(value, np.generic):
+        value = value.item()
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _log_identifier_sort_key(value):
+    normalized = _normalize_log_identifier(value)
+    if isinstance(normalized, int):
+        return (0, normalized)
+    return (1, str(normalized))
+
+
+def _normalize_identifier_list(values) -> list[int | str]:
+    if not values:
+        return []
+    return sorted(
+        (_normalize_log_identifier(value) for value in values),
+        key=_log_identifier_sort_key,
+    )
+
+
+def _build_traffic_light_classification_record(
+    category: str,
+    lanelet,
+    *,
+    traffic_light_ids=None,
+    edge_id=None,
+    replacement_edge_id=None,
+    has_intersection_mapping: bool | None = None,
+    note: str | None = None,
+) -> dict:
+    if traffic_light_ids is None:
+        traffic_light_ids = getattr(lanelet, "traffic_lights", [])
+
+    record = {
+        "category": category,
+        "lanelet_id": _normalize_log_identifier(lanelet.lanelet_id),
+        "traffic_light_ids": _normalize_identifier_list(traffic_light_ids),
+        "successor_ids": _normalize_identifier_list(getattr(lanelet, "successor", [])),
+    }
+
+    if edge_id is not None:
+        record["edge_id"] = _normalize_log_identifier(edge_id)
+    if replacement_edge_id is not None:
+        record["replacement_edge_id"] = _normalize_log_identifier(replacement_edge_id)
+    if has_intersection_mapping is not None:
+        record["has_intersection_mapping"] = bool(has_intersection_mapping)
+    if note:
+        record["note"] = note
+
+    return record
+
+
+def _summarize_traffic_light_classification_records(records_by_category: dict[str, list[dict]]) -> dict:
+    summary = {}
+    for category, records in records_by_category.items():
+        unique_traffic_light_ids = sorted(
+            {
+                traffic_light_id
+                for record in records
+                for traffic_light_id in record.get("traffic_light_ids", [])
+            },
+            key=_log_identifier_sort_key,
+        )
+        summary[category] = {
+            "lanelet_count": len(records),
+            "unique_traffic_light_count": len(unique_traffic_light_ids),
+        }
+    return summary
+
+
+def _log_traffic_light_classification_records(records_by_category: dict[str, list[dict]]):
+    if not any(records_by_category.values()):
+        return
+
+    _LOGGER.info(
+        "Traffic-light classification is lanelet-based; one traffic-light ID may appear in multiple categories."
+    )
+    _LOGGER.info(
+        "Traffic-light classification summary: %s",
+        json.dumps(_summarize_traffic_light_classification_records(records_by_category), sort_keys=True),
+    )
+
+    for category, records in records_by_category.items():
+        if not records:
+            continue
+        level = logging.WARNING if category.startswith("skipped_") else logging.INFO
+        for record in records:
+            _LOGGER.log(
+                level,
+                "Traffic-light classification record: %s",
+                json.dumps(record, sort_keys=True),
+            )
 
 
 def _normalized_member_values(values) -> tuple[str, ...]:
@@ -470,6 +580,12 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
         new_edge_ids = set(self.new_edges.keys())
         temporarily_disabled = []
         temporarily_remapped_lanelet_edges = []
+        records_by_category = {
+            "normal": [],
+            "remapped": [],
+            "skipped_ambiguous": [],
+            "skipped_removed_no_unique_upstream": [],
+        }
         ambiguous_lanelet_ids = []
         removed_lanelet_ids_no_unique_upstream = []
         skipped_ambiguous_successor = 0
@@ -480,16 +596,25 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
             if not lanelet.traffic_lights:
                 continue
 
+            has_intersection_mapping = lanelet.lanelet_id in incoming_lanelet_2_intersection
+
             # Keep existing safeguard: skip lanelets where direction->connection mapping is undefined.
-            if (
-                lanelet.lanelet_id not in incoming_lanelet_2_intersection
-                and len(lanelet.successor) != 1
-            ):
+            if not has_intersection_mapping and len(lanelet.successor) != 1:
                 original_lights = lanelet.traffic_lights
                 temporarily_disabled.append((lanelet, original_lights))
                 lanelet.traffic_lights = _empty_container_like(original_lights)
                 skipped_ambiguous_successor += 1
                 ambiguous_lanelet_ids.append(str(lanelet.lanelet_id))
+                records_by_category["skipped_ambiguous"].append(
+                    _build_traffic_light_classification_record(
+                        "skipped_ambiguous",
+                        lanelet,
+                        traffic_light_ids=original_lights,
+                        edge_id=self.lanelet_id2edge_id.get(lanelet.lanelet_id),
+                        has_intersection_mapping=has_intersection_mapping,
+                        note="no intersection mapping and successor count != 1",
+                    )
+                )
                 continue
 
             lanelet_edge_id = self.lanelet_id2edge_id.get(lanelet.lanelet_id)
@@ -499,6 +624,16 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
                 lanelet.traffic_lights = _empty_container_like(original_lights)
                 skipped_removed_edge_no_unique_upstream += 1
                 removed_lanelet_ids_no_unique_upstream.append(str(lanelet.lanelet_id))
+                records_by_category["skipped_removed_no_unique_upstream"].append(
+                    _build_traffic_light_classification_record(
+                        "skipped_removed_no_unique_upstream",
+                        lanelet,
+                        traffic_light_ids=original_lights,
+                        edge_id=lanelet_edge_id,
+                        has_intersection_mapping=has_intersection_mapping,
+                        note="lanelet had no edge mapping",
+                    )
+                )
                 continue
 
             if lanelet_edge_id not in self.new_edges:
@@ -511,11 +646,42 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
                     lanelet.traffic_lights = _empty_container_like(original_lights)
                     skipped_removed_edge_no_unique_upstream += 1
                     removed_lanelet_ids_no_unique_upstream.append(str(lanelet.lanelet_id))
+                    records_by_category["skipped_removed_no_unique_upstream"].append(
+                        _build_traffic_light_classification_record(
+                            "skipped_removed_no_unique_upstream",
+                            lanelet,
+                            traffic_light_ids=original_lights,
+                            edge_id=lanelet_edge_id,
+                            has_intersection_mapping=has_intersection_mapping,
+                            note="removed edge had no unique upstream surviving replacement",
+                        )
+                    )
                     continue
 
                 temporarily_remapped_lanelet_edges.append((lanelet.lanelet_id, lanelet_edge_id))
                 self.lanelet_id2edge_id[lanelet.lanelet_id] = replacement_edge_id
                 remapped_removed_edges += 1
+                records_by_category["remapped"].append(
+                    _build_traffic_light_classification_record(
+                        "remapped",
+                        lanelet,
+                        edge_id=lanelet_edge_id,
+                        replacement_edge_id=replacement_edge_id,
+                        has_intersection_mapping=has_intersection_mapping,
+                    )
+                )
+                continue
+
+            records_by_category["normal"].append(
+                _build_traffic_light_classification_record(
+                    "normal",
+                    lanelet,
+                    edge_id=lanelet_edge_id,
+                    has_intersection_mapping=has_intersection_mapping,
+                )
+            )
+
+        _log_traffic_light_classification_records(records_by_category)
 
         if skipped_ambiguous_successor:
             _LOGGER.warning(
