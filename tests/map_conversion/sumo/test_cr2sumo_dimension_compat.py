@@ -47,6 +47,18 @@ class TestCR2SumoDimensionCompat(unittest.TestCase):
         self.assertEqual(3, lanelet.left_vertices.shape[1])
         self.assertEqual(3, lanelet.right_vertices.shape[1])
 
+    def test_erode_lanelet_does_not_over_shrink_thin_lanelet(self):
+        x_values = np.linspace(0.0, 20.0, 11)
+        center = np.column_stack((x_values, np.zeros_like(x_values), np.linspace(1.0, 2.0, 11)))
+        left = center + np.array([0.0, 0.35, 0.0])
+        right = center + np.array([0.0, -0.35, 0.0])
+        lanelet = self._lanelet_cls(left, center, right, lanelet_id=2)
+
+        self._util.erode_lanelet(lanelet, radius=0.4)
+
+        min_width = np.min(np.linalg.norm(lanelet.left_vertices - lanelet.right_vertices, axis=1))
+        self.assertGreater(min_width, 0.5)
+
     def test_apply_patch_is_idempotent(self):
         # Already applied in setUpClass.
         self.assertFalse(apply_commonroad_sumo_nd_patch())

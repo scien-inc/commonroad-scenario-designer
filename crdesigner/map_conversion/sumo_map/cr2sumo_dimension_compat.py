@@ -169,7 +169,11 @@ def apply_commonroad_sumo_nd_patch() -> bool:
                 [lanelet_obj.center_vertices]
             )
 
-        if np.min(np.linalg.norm(lanelet.left_vertices - lanelet.right_vertices, axis=1)) > radius:
+        # Width erosion moves both boundaries inward by `radius`, so thin lanelets need
+        # at least `2 * radius` total width to avoid self-intersection.
+        if np.min(np.linalg.norm(lanelet.left_vertices - lanelet.right_vertices, axis=1)) > (
+            2.0 * radius
+        ):
             left = lanelet.center_vertices - lanelet.left_vertices
             lanelet._left_vertices += left / np.linalg.norm(left, axis=1)[np.newaxis].T * radius
             right = lanelet.center_vertices - lanelet.right_vertices
