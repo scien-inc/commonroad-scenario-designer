@@ -12,6 +12,7 @@ from commonroad_sumo.cr2sumo import CR2SumoMapConverter
 
 from crdesigner.common.logging import logger
 from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
+    apply_commonroad_sumo_lane_grouping_patch,
     apply_commonroad_sumo_nd_patch,
     apply_commonroad_sumo_traffic_light_patch,
 )
@@ -243,6 +244,7 @@ class AddTrafficLightsController:
             return
         self.road_network_toolbox_ui.referenced_lanelets_traffic_light.clear()
         apply_commonroad_sumo_nd_patch()
+        apply_commonroad_sumo_lane_grouping_patch()
         apply_commonroad_sumo_traffic_light_patch()
         converter = CR2SumoMapConverter(
             self.scenario_model.get_current_scenario(),

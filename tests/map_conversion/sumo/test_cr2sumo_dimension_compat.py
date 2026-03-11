@@ -5,6 +5,8 @@ import numpy as np
 
 from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
     _find_unique_upstream_replacement_edge_id,
+    _split_lanelet_ids_by_compatibility,
+    apply_commonroad_sumo_lane_grouping_patch,
     apply_commonroad_sumo_nd_patch,
     apply_commonroad_sumo_traffic_light_patch,
 )
@@ -16,6 +18,28 @@ from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
     "commonroad/commonroad_sumo not installed",
 )
 class TestCR2SumoDimensionCompat(unittest.TestCase):
+    class _FakeLanelet:
+        def __init__(
+            self,
+            lanelet_id: int,
+            lanelet_type=None,
+            user_one_way=None,
+            user_bidirectional=None,
+        ):
+            self.lanelet_id = lanelet_id
+            self.lanelet_type = lanelet_type if lanelet_type is not None else set()
+            self.user_one_way = user_one_way if user_one_way is not None else set()
+            self.user_bidirectional = (
+                user_bidirectional if user_bidirectional is not None else set()
+            )
+
+    class _FakeLaneletNetwork:
+        def __init__(self, lanelets):
+            self._lanelets = {lanelet.lanelet_id: lanelet for lanelet in lanelets}
+
+        def find_lanelet_by_id(self, lanelet_id):
+            return self._lanelets.get(lanelet_id)
+
     class _FakeEdge:
         def __init__(self, edge_id):
             self.id = edge_id
@@ -79,6 +103,47 @@ class TestCR2SumoDimensionCompat(unittest.TestCase):
     def test_apply_traffic_light_patch_is_idempotent(self):
         apply_commonroad_sumo_traffic_light_patch()
         self.assertFalse(apply_commonroad_sumo_traffic_light_patch())
+
+    def test_apply_lane_grouping_patch_is_idempotent(self):
+        apply_commonroad_sumo_lane_grouping_patch()
+        self.assertFalse(apply_commonroad_sumo_lane_grouping_patch())
+
+    def test_split_lanelet_ids_by_compatibility_splits_mixed_types(self):
+        lanelets = [
+            self._FakeLanelet(659, lanelet_type={"urban"}, user_one_way={"bicycle", "car"}),
+            self._FakeLanelet(661, lanelet_type={"urban"}, user_one_way={"bicycle", "car"}),
+            self._FakeLanelet(725, lanelet_type={"urban"}, user_one_way={"bicycle", "car"}),
+            self._FakeLanelet(723, lanelet_type={"urban"}, user_one_way={"bicycle", "car"}),
+            self._FakeLanelet(975, lanelet_type={"bicycleLane"}, user_one_way={"bicycle"}),
+        ]
+        lanelet_network = self._FakeLaneletNetwork(lanelets)
+
+        segments = _split_lanelet_ids_by_compatibility(
+            lanelet_network, [659, 661, 725, 723, 975]
+        )
+        self.assertEqual([[659, 661, 725, 723], [975]], segments)
+
+    def test_split_lanelet_ids_by_compatibility_keeps_same_signature(self):
+        lanelets = [
+            self._FakeLanelet(1, lanelet_type={"urban"}, user_one_way={"car"}),
+            self._FakeLanelet(2, lanelet_type={"urban"}, user_one_way={"car"}),
+            self._FakeLanelet(3, lanelet_type={"urban"}, user_one_way={"car"}),
+        ]
+        lanelet_network = self._FakeLaneletNetwork(lanelets)
+
+        segments = _split_lanelet_ids_by_compatibility(lanelet_network, [1, 2, 3])
+        self.assertEqual([[1, 2, 3]], segments)
+
+    def test_split_lanelet_ids_by_compatibility_only_splits_contiguous_parts(self):
+        lanelets = [
+            self._FakeLanelet(1, lanelet_type={"urban"}, user_one_way={"car"}),
+            self._FakeLanelet(2, lanelet_type={"bicycleLane"}, user_one_way={"bicycle"}),
+            self._FakeLanelet(3, lanelet_type={"urban"}, user_one_way={"car"}),
+        ]
+        lanelet_network = self._FakeLaneletNetwork(lanelets)
+
+        segments = _split_lanelet_ids_by_compatibility(lanelet_network, [1, 2, 3])
+        self.assertEqual([[1], [2], [3]], segments)
 
     def test_find_unique_upstream_replacement_edge_id_unique(self):
         e1 = self._FakeEdge(1)
