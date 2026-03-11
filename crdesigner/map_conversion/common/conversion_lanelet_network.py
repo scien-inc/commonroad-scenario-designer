@@ -798,21 +798,11 @@ class ConversionLaneletNetwork(LaneletNetwork):
         :param incomings: List of incomings to find their left of.
         """
         # Choose a reference incoming vector
-        ref = (
-            self.find_lanelet_by_id(list(incomings[0].incoming_lanelets)[0]).center_vertices[-1]
-            - self.find_lanelet_by_id(list(incomings[0].incoming_lanelets)[0]).center_vertices[-3]
-        )
+        ref = self._incoming_direction_vector(incomings[0])
         angles = [(0, 0)]
         # calculate all incoming angle from the reference incoming vector
         for index in range(1, len(incomings)):
-            new_v = (
-                self.find_lanelet_by_id(
-                    list(incomings[index].incoming_lanelets)[0]
-                ).center_vertices[-1]
-                - self.find_lanelet_by_id(
-                    list(incomings[index].incoming_lanelets)[0]
-                ).center_vertices[-2]
-            )
+            new_v = self._incoming_direction_vector(incomings[index])
             angle = geometry.get_angle(ref, new_v)
             if angle < 0:
                 angle += 360
@@ -847,6 +837,25 @@ class ConversionLaneletNetwork(LaneletNetwork):
                     prev = -1
                 else:
                     prev -= 1
+
+    def _incoming_direction_vector(self, incoming: IntersectionIncomingElement) -> np.ndarray:
+        """Return a stable incoming direction vector even for short lanelets."""
+        lanelet = self.find_lanelet_by_id(list(incoming.incoming_lanelets)[0])
+        if lanelet is None or len(lanelet.center_vertices) == 0:
+            return np.array([1.0, 0.0])
+
+        if len(lanelet.center_vertices) == 1:
+            return np.array([1.0, 0.0])
+
+        end_vertex = lanelet.center_vertices[-1][:2]
+        start_index = -3 if len(lanelet.center_vertices) >= 3 else -2
+        start_vertex = lanelet.center_vertices[start_index][:2]
+        direction = end_vertex - start_vertex
+
+        if np.linalg.norm(direction) == 0:
+            return np.array([1.0, 0.0])
+
+        return direction
 
     def combine_common_incoming_lanelets(
         self, intersection_map: Dict[int, List[int]]

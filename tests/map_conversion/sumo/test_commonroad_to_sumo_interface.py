@@ -14,6 +14,8 @@ class TestCommonRoadToSumoInterface(unittest.TestCase):
         with patch.object(
             map_conversion_interface, "apply_commonroad_sumo_nd_patch"
         ) as nd_patch_fn, patch.object(
+            map_conversion_interface, "apply_commonroad_sumo_lane_grouping_patch"
+        ) as lane_group_patch_fn, patch.object(
             map_conversion_interface, "apply_commonroad_sumo_traffic_light_patch"
         ) as tl_patch_fn, patch.object(
             map_conversion_interface, "CR2SumoMapConverter", converter_cls
@@ -28,6 +30,7 @@ class TestCommonRoadToSumoInterface(unittest.TestCase):
             )
 
         nd_patch_fn.assert_called_once()
+        lane_group_patch_fn.assert_called_once()
         tl_patch_fn.assert_called_once()
         converter_cls.from_file.assert_called_once_with("in.xml")
         converter_instance.create_sumo_files.assert_called_once_with(Path("/tmp/out/sumo"))
@@ -50,6 +53,8 @@ class TestCommonRoadToSumoInterface(unittest.TestCase):
         with patch.object(
             map_conversion_interface, "apply_commonroad_sumo_nd_patch"
         ) as nd_patch_fn, patch.object(
+            map_conversion_interface, "apply_commonroad_sumo_lane_grouping_patch"
+        ) as lane_group_patch_fn, patch.object(
             map_conversion_interface, "apply_commonroad_sumo_traffic_light_patch"
         ) as tl_patch_fn, patch.object(
             map_conversion_interface, "CR2SumoMapConverter", converter_cls
@@ -64,6 +69,7 @@ class TestCommonRoadToSumoInterface(unittest.TestCase):
             )
 
         nd_patch_fn.assert_called_once()
+        lane_group_patch_fn.assert_called_once()
         tl_patch_fn.assert_called_once()
         converter_cls.from_file.assert_called_once_with("in.xml")
         scenario.convert_to_2d.assert_called_once_with(map_name="my_map")
@@ -77,6 +83,8 @@ class TestCommonRoadToSumoInterface(unittest.TestCase):
         converter_cls.from_file.return_value = converter_preserve
 
         with patch.object(map_conversion_interface, "apply_commonroad_sumo_nd_patch"), patch.object(
+            map_conversion_interface, "apply_commonroad_sumo_lane_grouping_patch"
+        ), patch.object(
             map_conversion_interface, "apply_commonroad_sumo_traffic_light_patch"
         ), patch.object(map_conversion_interface, "CR2SumoMapConverter", converter_cls), patch.object(
             map_conversion_interface, "CRDesignerFileReader"
@@ -103,6 +111,8 @@ class TestCommonRoadToSumoInterface(unittest.TestCase):
         with patch.object(
             map_conversion_interface, "apply_commonroad_sumo_nd_patch"
         ) as nd_patch_fn, patch.object(
+            map_conversion_interface, "apply_commonroad_sumo_lane_grouping_patch"
+        ) as lane_group_patch_fn, patch.object(
             map_conversion_interface, "apply_commonroad_sumo_traffic_light_patch"
         ) as tl_patch_fn, patch.object(
             map_conversion_interface, "CRDesignerFileReader", return_value=reader_instance
@@ -117,6 +127,7 @@ class TestCommonRoadToSumoInterface(unittest.TestCase):
             )
 
         nd_patch_fn.assert_not_called()
+        lane_group_patch_fn.assert_called_once()
         tl_patch_fn.assert_called_once()
         converter_cls.from_file.assert_not_called()
         scenario.convert_to_2d.assert_called_once_with(map_name="my_map")

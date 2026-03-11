@@ -76,6 +76,9 @@ def main(
     projection: Annotated[
         Optional[str], typer.Option(help="Projection string for coordinate transformation")
     ] = None,
+    country_id: Annotated[
+        str, typer.Option(help="CommonRoad country ID to store in the scenario metadata")
+    ] = "ZAM",
     author: Annotated[str, typer.Option(..., help="Your name")] = "",
     affiliation: Annotated[
         str,
@@ -91,6 +94,7 @@ def main(
         # Set projection if provided
         if projection is not None:
             general_config.proj_string_cr = projection
+        general_config.country_id = country_id.upper()
 
         # copied from commonroad-dataset-converter
         frame = inspect.currentframe()

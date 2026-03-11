@@ -1,6 +1,7 @@
 import logging
+from dataclasses import dataclass, field
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 from commonroad.scenario.area import Area, AreaBorder
@@ -300,6 +301,16 @@ def _two_vertices_coincide(
     return True
 
 
+@dataclass
+class _TrafficLightRecord:
+    traffic_light: TrafficLight
+    regulatory_element_id: str
+    candidate_lanelet_ids: Set[int] = field(default_factory=set)
+    incoming_lanelet_ids: Set[int] = field(default_factory=set)
+    controlled_successor_ids: Set[int] = field(default_factory=set)
+    turn_directions: Set[str] = field(default_factory=set)
+
+
 class Lanelet2CRConverter:
     """
     Class to convert OSM to the Commonroad representation of Lanelets.
@@ -520,10 +531,11 @@ class Lanelet2CRConverter:
                 )
                 self.lanelet_network.add_traffic_sign(speed_limit, first_occurrence)
 
-        # traffic light conversion
-        for way in osm.ways:
-            if osm.ways[way].tag_dict.get("type") == "traffic_light":
-                self.traffic_light_conversion(osm.ways[way], new_ids)
+        traffic_light_records = self._collect_traffic_light_records(new_ids)
+        self._build_signalized_intersections(traffic_light_records)
+        traffic_lights = self._build_commonroad_traffic_lights(traffic_light_records)
+        if traffic_lights:
+            self.lanelet_network.add_traffic_lights_to_network(traffic_lights)
 
         for la in self.lanelet_network.lanelets:
             la.__class__ = Lanelet
@@ -538,14 +550,22 @@ class Lanelet2CRConverter:
 
         return scenario
 
-    def traffic_light_conversion(self, traffic_light_way: Way, new_lanelet_ids: Dict[str, int]):
+    def traffic_light_conversion(
+        self,
+        traffic_light_way: Way,
+        new_lanelet_ids: Dict[str, int],
+        direction: TrafficLightDirection = TrafficLightDirection.ALL,
+    ) -> TrafficLight:
         """
         Converting a traffic light, which is formatted as Way in Lanelet2 format, to
         CommonRoad format
 
         :param traffic_light_way: Way that is being used for conversion
         :param new_lanelet_ids: Dictionary that appends new ids to newly created CR objects
+        :param direction: Direction controlled by the traffic light
+        :return: Converted CommonRoad traffic light
         """
+        del new_lanelet_ids
         # create a TrafficLight element (CR format) from the traffic light way (L2 format\<)
         # id,cycle,position,offset,direction,active
         # for autoware, the traffic light id is retained
@@ -569,34 +589,399 @@ class Lanelet2CRConverter:
 
         position = np.array([x, y, float(node.ele)]) if node.ele != "0.0" else np.array([x, y])
 
-        # need to assign lanelet to that trafficLight
-        # find the traffic_light_relations corresponding to our traffic_light_way and add them to the list
-        traffic_light_relations = []
-        for tl_relation in self.osm.traffic_light_relations:
-            for ref in self.osm.traffic_light_relations[tl_relation].refers:
-                if ref == traffic_light_way.id_:
-                    traffic_light_relations.append(tl_relation)
-
-        # now go through the lanelets and find the relation, which would match the traffic light and the lanelet
-        wr_lanelets = set()
-        for wr in self.osm.way_relations:
-            for re in self.osm.way_relations[wr].regulatory_elements:
-                if re in traffic_light_relations:
-                    # found the wr, now need to match it with corresponding lanelet
-                    # for that the "new_lanelet_ids" dict is used that is sent to this function
-                    wr_lanelets.add(new_lanelet_ids[wr])
-
-        # create the traffic light
-        traffic_light = TrafficLight(
+        return TrafficLight(
             new_id,
             position,
             TrafficLightCycle(cycle_list, 1),
             active=active,
-            direction=TrafficLightDirection.STRAIGHT,
+            direction=direction,
         )
 
-        # add the traffic light to our lanelet network
-        self.lanelet_network.add_traffic_light(traffic_light, wr_lanelets)
+    def _collect_traffic_light_records(
+        self, new_lanelet_ids: Dict[str, int]
+    ) -> List[_TrafficLightRecord]:
+        records: List[_TrafficLightRecord] = []
+        processed_way_ids: Set[str] = set()
+
+        for tl_relation in self.osm.traffic_light_relations.values():
+            for way_id in tl_relation.refers:
+                processed_way_ids.add(way_id)
+
+            traffic_light_way = None
+            for way_id in tl_relation.refers:
+                way = self.osm.find_way_by_id(way_id)
+                if way is not None and way.tag_dict.get("type") == "traffic_light":
+                    traffic_light_way = way
+                    break
+            if traffic_light_way is None:
+                continue
+
+            candidate_lanelet_ids, turn_directions = self._find_lanelets_referencing_tl_relation(
+                tl_relation.id_, new_lanelet_ids
+            )
+            incoming_lanelet_ids = self._resolve_incoming_lanelets_from_ref_line(
+                tl_relation.ref_line, candidate_lanelet_ids
+            )
+            controlled_successor_ids = self._find_controlled_successors(
+                incoming_lanelet_ids, candidate_lanelet_ids
+            )
+            direction = self._derive_direction_from_turn_tags(turn_directions)
+            if direction is None:
+                direction = self._derive_direction_from_geometry(
+                    next(iter(sorted(incoming_lanelet_ids)), None), controlled_successor_ids
+                )
+
+            records.append(
+                _TrafficLightRecord(
+                    traffic_light=self.traffic_light_conversion(
+                        traffic_light_way, new_lanelet_ids, direction=direction
+                    ),
+                    regulatory_element_id=tl_relation.id_,
+                    candidate_lanelet_ids=candidate_lanelet_ids,
+                    incoming_lanelet_ids=incoming_lanelet_ids,
+                    controlled_successor_ids=controlled_successor_ids,
+                    turn_directions=turn_directions,
+                )
+            )
+
+        for way in self.osm.ways.values():
+            if way.tag_dict.get("type") != "traffic_light" or way.id_ in processed_way_ids:
+                continue
+            records.append(
+                _TrafficLightRecord(
+                    traffic_light=self.traffic_light_conversion(way, new_lanelet_ids),
+                    regulatory_element_id=way.id_,
+                )
+            )
+
+        return records
+
+    def _find_lanelets_referencing_tl_relation(
+        self, tl_relation_id: str, new_lanelet_ids: Dict[str, int]
+    ) -> Tuple[Set[int], Set[str]]:
+        lanelet_ids: Set[int] = set()
+        turn_directions: Set[str] = set()
+
+        for way_relation in self.osm.way_relations.values():
+            if tl_relation_id not in way_relation.regulatory_elements:
+                continue
+            lanelet_id = new_lanelet_ids.get(way_relation.id_)
+            if lanelet_id is None:
+                continue
+            lanelet_ids.add(lanelet_id)
+            turn_direction = way_relation.tag_dict.get("turn_direction")
+            if turn_direction:
+                turn_directions.add(turn_direction)
+
+        return lanelet_ids, turn_directions
+
+    def _resolve_incoming_lanelets_from_ref_line(
+        self, ref_line_way_ids: List[str], candidate_lanelet_ids: Set[int]
+    ) -> Set[int]:
+        if not candidate_lanelet_ids:
+            return set()
+
+        if not ref_line_way_ids:
+            return self._expand_same_direction_lanelets(candidate_lanelet_ids)
+
+        incoming_lanelet_ids: Set[int] = set()
+        for ref_line_way_id in ref_line_way_ids:
+            ref_line_way = self.osm.find_way_by_id(ref_line_way_id)
+            if ref_line_way is None:
+                continue
+
+            ref_vertices = self._convert_way_to_vertices(ref_line_way)
+            if len(ref_vertices) < 2:
+                continue
+
+            ref_line = LineString(ref_vertices[:, :2])
+            ref_midpoint = np.mean(ref_vertices, axis=0)
+            intersecting_candidates = []
+            closest_candidate = None
+            closest_distance = float("inf")
+
+            for lanelet_id in candidate_lanelet_ids:
+                lanelet = self.lanelet_network.find_lanelet_by_id(lanelet_id)
+                if lanelet is None:
+                    continue
+
+                try:
+                    intersects = lanelet.polygon.shapely_object.intersects(ref_line)
+                except Exception:
+                    intersects = False
+
+                lanelet_end = lanelet.center_vertices[-1][:2]
+                midpoint_2d = ref_midpoint[:2]
+                end_distance = float(np.linalg.norm(midpoint_2d - lanelet_end))
+                if end_distance < closest_distance:
+                    closest_distance = end_distance
+                    closest_candidate = lanelet_id
+                if intersects:
+                    intersecting_candidates.append(lanelet_id)
+
+            seed_lanelet_ids = intersecting_candidates or (
+                [closest_candidate] if closest_candidate is not None else []
+            )
+
+            for seed_lanelet_id in seed_lanelet_ids:
+                incoming_lanelet_ids.add(
+                    self._trace_upstream_to_incoming(
+                        seed_lanelet_id,
+                        ref_midpoint,
+                        candidate_lanelet_ids,
+                    )
+                )
+
+        if not incoming_lanelet_ids:
+            incoming_lanelet_ids = {
+                self._trace_upstream_to_incoming(lanelet_id, None, candidate_lanelet_ids)
+                for lanelet_id in candidate_lanelet_ids
+            }
+
+        return self._expand_same_direction_lanelets(incoming_lanelet_ids)
+
+    def _trace_upstream_to_incoming(
+        self,
+        seed_lanelet_id: int,
+        ref_midpoint: Optional[np.ndarray],
+        controlled_lanelet_ids: Set[int],
+    ) -> int:
+        lanelet = self.lanelet_network.find_lanelet_by_id(seed_lanelet_id)
+        if lanelet is None:
+            return seed_lanelet_id
+
+        if ref_midpoint is not None and self._ref_line_is_near_lanelet_end(ref_midpoint, lanelet):
+            return lanelet.lanelet_id
+
+        current = lanelet
+        travelled_distance = 0.0
+        hops = 0
+        visited = {current.lanelet_id}
+
+        while hops < 3 and travelled_distance < 40.0 and len(current.predecessor) == 1:
+            predecessor = self.lanelet_network.find_lanelet_by_id(current.predecessor[0])
+            if predecessor is None or predecessor.lanelet_id in visited:
+                break
+
+            travelled_distance += float(
+                np.linalg.norm(current.center_vertices[0][:2] - predecessor.center_vertices[-1][:2])
+            )
+            current = predecessor
+            visited.add(current.lanelet_id)
+            hops += 1
+
+            if len(current.successor) > 1:
+                break
+            if ref_midpoint is not None and self._ref_line_is_near_lanelet_end(ref_midpoint, current):
+                break
+            if current.lanelet_id in controlled_lanelet_ids and len(current.predecessor) != 1:
+                break
+
+        return current.lanelet_id
+
+    def _ref_line_is_near_lanelet_end(
+        self, ref_midpoint: np.ndarray, lanelet: ConversionLanelet
+    ) -> bool:
+        midpoint_2d = ref_midpoint[:2]
+        start_distance = float(np.linalg.norm(midpoint_2d - lanelet.center_vertices[0][:2]))
+        end_distance = float(np.linalg.norm(midpoint_2d - lanelet.center_vertices[-1][:2]))
+        return end_distance <= start_distance
+
+    def _expand_same_direction_lanelets(self, lanelet_ids: Set[int]) -> Set[int]:
+        expanded_lanelet_ids = set(lanelet_ids)
+        queue = list(lanelet_ids)
+
+        while queue:
+            lanelet_id = queue.pop()
+            lanelet = self.lanelet_network.find_lanelet_by_id(lanelet_id)
+            if lanelet is None:
+                continue
+
+            adjacent_candidates = [
+                (lanelet.adj_left, lanelet.adj_left_same_direction),
+                (lanelet.adj_right, lanelet.adj_right_same_direction),
+            ]
+            for adjacent_lanelet_id, same_direction in adjacent_candidates:
+                if (
+                    adjacent_lanelet_id is None
+                    or not same_direction
+                    or adjacent_lanelet_id in expanded_lanelet_ids
+                ):
+                    continue
+                expanded_lanelet_ids.add(adjacent_lanelet_id)
+                queue.append(adjacent_lanelet_id)
+
+        return expanded_lanelet_ids
+
+    def _build_signalized_intersections(self, traffic_light_records: List[_TrafficLightRecord]):
+        incoming_to_successors: Dict[int, Set[int]] = defaultdict(set)
+        for record in traffic_light_records:
+            for incoming_lanelet_id in record.incoming_lanelet_ids:
+                lanelet = self.lanelet_network.find_lanelet_by_id(incoming_lanelet_id)
+                if lanelet is None:
+                    continue
+                incoming_to_successors[incoming_lanelet_id].update(lanelet.successor)
+
+        if len(incoming_to_successors) < 2:
+            return
+
+        remaining_lanelet_ids = set(incoming_to_successors.keys())
+        components: List[Set[int]] = []
+
+        while remaining_lanelet_ids:
+            start_lanelet_id = remaining_lanelet_ids.pop()
+            component = {start_lanelet_id}
+            pending = [start_lanelet_id]
+
+            while pending:
+                lanelet_id = pending.pop()
+                for other_lanelet_id in list(remaining_lanelet_ids):
+                    if self._incoming_successors_intersect(
+                        lanelet_id,
+                        other_lanelet_id,
+                        incoming_to_successors,
+                    ):
+                        remaining_lanelet_ids.remove(other_lanelet_id)
+                        component.add(other_lanelet_id)
+                        pending.append(other_lanelet_id)
+
+            if len(component) >= 2:
+                components.append(component)
+
+        for component in components:
+            intersection_map = {
+                incoming_lanelet_id: sorted(incoming_to_successors[incoming_lanelet_id])
+                for incoming_lanelet_id in component
+                if incoming_to_successors[incoming_lanelet_id]
+            }
+            if len(intersection_map) >= 2:
+                self.lanelet_network.create_intersection(intersection_map, set(intersection_map.keys()))
+
+    def _incoming_successors_intersect(
+        self,
+        lanelet_id: int,
+        other_lanelet_id: int,
+        incoming_to_successors: Dict[int, Set[int]],
+    ) -> bool:
+        for successor_id in incoming_to_successors[lanelet_id]:
+            successor_lanelet = self.lanelet_network.find_lanelet_by_id(successor_id)
+            if successor_lanelet is None:
+                continue
+            for other_successor_id in incoming_to_successors[other_lanelet_id]:
+                if successor_id == other_successor_id:
+                    return True
+                other_successor_lanelet = self.lanelet_network.find_lanelet_by_id(other_successor_id)
+                if other_successor_lanelet is None:
+                    continue
+                try:
+                    if successor_lanelet.polygon.shapely_object.intersects(
+                        other_successor_lanelet.polygon.shapely_object
+                    ):
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _find_controlled_successors(
+        self, incoming_lanelet_ids: Set[int], candidate_lanelet_ids: Set[int]
+    ) -> Set[int]:
+        controlled_successors = set()
+        for incoming_lanelet_id in incoming_lanelet_ids:
+            lanelet = self.lanelet_network.find_lanelet_by_id(incoming_lanelet_id)
+            if lanelet is None:
+                continue
+            controlled_successors.update(
+                successor_id for successor_id in lanelet.successor if successor_id in candidate_lanelet_ids
+            )
+
+        if controlled_successors:
+            return controlled_successors
+
+        for incoming_lanelet_id in incoming_lanelet_ids:
+            lanelet = self.lanelet_network.find_lanelet_by_id(incoming_lanelet_id)
+            if lanelet is not None:
+                controlled_successors.update(lanelet.successor)
+
+        return controlled_successors
+
+    def _derive_direction_from_turn_tags(
+        self, turn_directions: Set[str]
+    ) -> Optional[TrafficLightDirection]:
+        normalized_directions = set()
+        for direction in turn_directions:
+            for token in (
+                direction.replace("|", ",").replace(";", ",").replace("/", ",").split(",")
+            ):
+                normalized = token.strip().lower()
+                if normalized in {"left", "slight_left", "sharp_left"}:
+                    normalized_directions.add("left")
+                elif normalized in {"right", "slight_right", "sharp_right"}:
+                    normalized_directions.add("right")
+                elif normalized in {"straight", "through"}:
+                    normalized_directions.add("straight")
+
+        if not normalized_directions or len(normalized_directions) == 3:
+            return None
+
+        return self._direction_names_to_enum(normalized_directions)
+
+    def _derive_direction_from_geometry(
+        self,
+        incoming_lanelet_id: Optional[int],
+        controlled_successor_ids: Set[int],
+    ) -> TrafficLightDirection:
+        if incoming_lanelet_id is None:
+            return TrafficLightDirection.ALL
+
+        incoming_lanelet = self.lanelet_network.find_lanelet_by_id(incoming_lanelet_id)
+        if incoming_lanelet is None:
+            return TrafficLightDirection.ALL
+
+        successor_directions = self.lanelet_network.get_successor_directions(incoming_lanelet)
+        relevant_successors = controlled_successor_ids or set(successor_directions.keys())
+        direction_names = {
+            successor_directions[successor_id]
+            for successor_id in relevant_successors
+            if successor_id in successor_directions
+        }
+        return self._direction_names_to_enum(direction_names) or TrafficLightDirection.ALL
+
+    def _direction_names_to_enum(
+        self, direction_names: Set[str]
+    ) -> Optional[TrafficLightDirection]:
+        normalized = frozenset(direction_names)
+        if not normalized:
+            return None
+        direction_map = {
+            frozenset({"left"}): TrafficLightDirection.LEFT,
+            frozenset({"right"}): TrafficLightDirection.RIGHT,
+            frozenset({"straight"}): TrafficLightDirection.STRAIGHT,
+            frozenset({"left", "straight"}): TrafficLightDirection.LEFT_STRAIGHT,
+            frozenset({"straight", "right"}): TrafficLightDirection.STRAIGHT_RIGHT,
+            frozenset({"left", "right"}): TrafficLightDirection.LEFT_RIGHT,
+            frozenset({"left", "straight", "right"}): TrafficLightDirection.ALL,
+        }
+        return direction_map.get(normalized)
+
+    def _build_commonroad_traffic_lights(
+        self, traffic_light_records: List[_TrafficLightRecord]
+    ) -> List[TrafficLight]:
+        traffic_lights = []
+        mapped_incoming_lanelet_ids = set(self.lanelet_network.map_inc_lanelets_to_intersections.keys())
+
+        for record in traffic_light_records:
+            if record.incoming_lanelet_ids & mapped_incoming_lanelet_ids:
+                for lanelet_id in record.candidate_lanelet_ids:
+                    lanelet = self.lanelet_network.find_lanelet_by_id(lanelet_id)
+                    if lanelet is not None:
+                        lanelet.add_traffic_light_to_lanelet(record.traffic_light.traffic_light_id)
+                traffic_lights.append(record.traffic_light)
+                continue
+
+            fallback_lanelet_ids = record.incoming_lanelet_ids or record.candidate_lanelet_ids
+            self.lanelet_network.add_traffic_light(record.traffic_light, fallback_lanelet_ids)
+
+        return traffic_lights
 
     def _right_of_way_to_traffic_sign(
         self, right_of_way_rel: RegulatoryElement, new_lanelet_ids: Dict[str, int]

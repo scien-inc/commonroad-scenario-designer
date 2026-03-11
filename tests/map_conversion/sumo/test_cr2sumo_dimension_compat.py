@@ -1,5 +1,8 @@
 import importlib.util
 import unittest
+from collections import namedtuple
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -99,6 +102,164 @@ class TestCR2SumoDimensionCompat(unittest.TestCase):
         # Already applied in setUpClass.
         self.assertFalse(apply_commonroad_sumo_nd_patch())
         self.assertFalse(apply_commonroad_sumo_nd_patch())
+
+    def test_a_traffic_light_patch_logs_zero_counts(self):
+        from commonroad_sumo.cr2sumo.map_converter import map_converter as cr2sumo_map_converter
+        from commonroad_sumo.cr2sumo.map_converter.map_converter import CR2SumoMapConverter
+        from crdesigner.map_conversion.sumo_map import cr2sumo_dimension_compat as compat
+
+        original_method = CR2SumoMapConverter._create_traffic_lights
+        original_flag = getattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG, None)
+
+        try:
+            compat._TL_PATCHED_ONCE = False
+            if hasattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG):
+                delattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG)
+
+            CR2SumoMapConverter._create_traffic_lights = lambda self: "ok"
+            with patch.object(compat, "_needs_traffic_light_patch", return_value=True):
+                self.assertTrue(apply_commonroad_sumo_traffic_light_patch())
+
+            fake_converter = SimpleNamespace(
+                _lanelet_network=SimpleNamespace(
+                    lanelets=[],
+                    map_inc_lanelets_to_intersections={},
+                ),
+                new_edges={},
+                lanelet_id2edge_id={},
+                edges={},
+            )
+
+            with self.assertLogs(
+                "crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat", level="INFO"
+            ) as logs:
+                result = CR2SumoMapConverter._create_traffic_lights(fake_converter)
+
+            self.assertEqual("ok", result)
+            joined_logs = "\n".join(logs.output)
+            self.assertIn(
+                "Skipping traffic-light encoding on 0 lanelets with ambiguous successors",
+                joined_logs,
+            )
+            self.assertIn(
+                "Remapped traffic-light lanelets from removed edges to unique upstream surviving edges: 0",
+                joined_logs,
+            )
+            self.assertIn(
+                "Skipped traffic-light encoding on 0 lanelets whose edge was removed",
+                joined_logs,
+            )
+        finally:
+            CR2SumoMapConverter._create_traffic_lights = original_method
+            compat._TL_PATCHED_ONCE = False
+            if original_flag is None:
+                if hasattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG):
+                    delattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG)
+            else:
+                setattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG, original_flag)
+
+    def test_traffic_light_patch_adjusts_unreachable_direction(self):
+        from commonroad.scenario.traffic_light import (
+            TrafficLight,
+            TrafficLightCycle,
+            TrafficLightCycleElement,
+            TrafficLightDirection,
+            TrafficLightState,
+        )
+        from commonroad_sumo.cr2sumo.map_converter import map_converter as cr2sumo_map_converter
+        from commonroad_sumo.cr2sumo.map_converter.map_converter import CR2SumoMapConverter
+        from crdesigner.map_conversion.sumo_map import cr2sumo_dimension_compat as compat
+
+        original_method = CR2SumoMapConverter._create_traffic_lights
+        original_flag = getattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG, None)
+
+        Connection = namedtuple("Connection", ["from_edge", "to_edge"])
+
+        class FakeIncomingElement:
+            def __init__(self):
+                self.successors_straight = {3}
+                self.successors_left = set()
+                self.successors_right = {2}
+
+        class FakeIntersection:
+            def __init__(self):
+                self.map_incoming_lanelets = {1: FakeIncomingElement()}
+
+        class FakeLanelet:
+            def __init__(self):
+                self.lanelet_id = 1
+                self.traffic_lights = {100}
+                self.successor = [2, 3]
+
+        class FakeEdge:
+            def __init__(self, edge_id):
+                self.id = edge_id
+                self.outgoing = []
+                self.incoming = []
+
+        lanelet = FakeLanelet()
+        edge_in = FakeEdge(10)
+        edge_right = FakeEdge(20)
+        edge_removed_straight = FakeEdge(30)
+
+        traffic_light = TrafficLight(
+            100,
+            np.array([0.0, 0.0]),
+            TrafficLightCycle([TrafficLightCycleElement(TrafficLightState.GREEN, 5)], 1),
+            active=True,
+            direction=TrafficLightDirection.STRAIGHT,
+        )
+
+        captured = {}
+
+        def fake_original_create_traffic_lights(self):
+            current_ids = set(self._lanelet_network.lanelets[0].traffic_lights)
+            captured["ids"] = current_ids
+            captured["directions"] = {
+                traffic_light_id: self._lanelet_network._traffic_lights[traffic_light_id].direction
+                for traffic_light_id in current_ids
+            }
+            return "ok"
+
+        try:
+            compat._TL_PATCHED_ONCE = False
+            if hasattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG):
+                delattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG)
+
+            CR2SumoMapConverter._create_traffic_lights = fake_original_create_traffic_lights
+            with patch.object(compat, "_needs_traffic_light_patch", return_value=True):
+                self.assertTrue(apply_commonroad_sumo_traffic_light_patch())
+
+            fake_converter = SimpleNamespace(
+                _lanelet_network=SimpleNamespace(
+                    lanelets=[lanelet],
+                    map_inc_lanelets_to_intersections={1: FakeIntersection()},
+                    _traffic_lights={100: traffic_light},
+                ),
+                new_edges={10: edge_in, 20: edge_right},
+                edges={10: edge_in, 20: edge_right, 30: edge_removed_straight},
+                lanelet_id2edge_id={1: 10, 2: 20, 3: 30},
+                _new_connections={Connection(edge_in, edge_right)},
+            )
+
+            result = CR2SumoMapConverter._create_traffic_lights(fake_converter)
+            self.assertEqual("ok", result)
+            self.assertEqual({100}, lanelet.traffic_lights)
+            self.assertEqual(TrafficLightDirection.STRAIGHT, traffic_light.direction)
+            self.assertEqual(1, len(captured["ids"]))
+            captured_light_id = next(iter(captured["ids"]))
+            self.assertNotEqual(100, captured_light_id)
+            self.assertEqual(
+                TrafficLightDirection.RIGHT, captured["directions"][captured_light_id]
+            )
+        finally:
+            CR2SumoMapConverter._create_traffic_lights = original_method
+            compat._TL_PATCHED_ONCE = False
+            if original_flag is None:
+                if hasattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG):
+                    delattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG)
+            else:
+                setattr(cr2sumo_map_converter, compat._TL_PATCH_FLAG, original_flag)
 
     def test_apply_traffic_light_patch_is_idempotent(self):
         apply_commonroad_sumo_traffic_light_patch()

@@ -88,7 +88,7 @@ class Lanelet2Config(BaseConfig):
     )
 
     allowed_tags = Attribute(
-        ["type", "subtype", "one_way", "virtual", "location", "bicycle", "highway"],
+        ["type", "subtype", "one_way", "virtual", "location", "bicycle", "highway", "turn_direction"],
         "Allowed Tags",
         "Lanelet tags which are considered for conversion. "
         "Lanelets with other tags are not converted.",

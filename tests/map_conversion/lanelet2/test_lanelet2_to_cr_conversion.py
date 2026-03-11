@@ -1,9 +1,12 @@
 import os
+import tempfile
 import time
 import unittest
+from textwrap import dedent
 
 from commonroad.planning.planning_problem import PlanningProblemSet  # type: ignore
 from commonroad.scenario.scenario import Scenario, Tag  # type: ignore
+from commonroad.scenario.traffic_light import TrafficLightDirection
 from lxml import etree  # type: ignore
 
 from crdesigner.common.config.general_config import general_config
@@ -19,6 +22,111 @@ from tests.map_conversion.utils import elements_equal
 
 def get_tmp_dir():
     return os.path.dirname(os.path.abspath(__file__)) + "/.pytest_cache" + "/"
+
+
+def _signalized_intersection_osm_xml() -> str:
+    return dedent(
+        """
+        <osm version="0.6">
+          <node id="1" lat="49.000009" lon="8.399720" />
+          <node id="2" lat="49.000009" lon="8.400000" />
+          <node id="3" lat="48.999991" lon="8.399720" />
+          <node id="4" lat="48.999991" lon="8.400000" />
+          <node id="5" lat="49.000009" lon="8.400280" />
+          <node id="6" lat="48.999991" lon="8.400280" />
+          <node id="7" lat="48.999720" lon="8.399991" />
+          <node id="8" lat="49.000000" lon="8.399991" />
+          <node id="9" lat="48.999720" lon="8.400009" />
+          <node id="10" lat="49.000000" lon="8.400009" />
+          <node id="11" lat="49.000280" lon="8.399991" />
+          <node id="12" lat="49.000280" lon="8.400009" />
+
+          <node id="21" lat="48.999995" lon="8.399985" />
+          <node id="22" lat="49.000000" lon="8.399985" />
+          <node id="23" lat="49.000005" lon="8.399985" />
+          <node id="24" lat="49.000015" lon="8.399995" />
+          <node id="25" lat="49.000015" lon="8.400000" />
+          <node id="26" lat="49.000015" lon="8.400005" />
+
+          <node id="31" lat="48.999991" lon="8.399980" />
+          <node id="32" lat="49.000009" lon="8.399980" />
+          <node id="33" lat="48.999985" lon="8.399991" />
+          <node id="34" lat="48.999985" lon="8.400009" />
+
+          <way id="1001"><nd ref="1"/><nd ref="2"/></way>
+          <way id="1002"><nd ref="3"/><nd ref="4"/></way>
+          <way id="1003"><nd ref="2"/><nd ref="5"/></way>
+          <way id="1004"><nd ref="4"/><nd ref="6"/></way>
+          <way id="1005"><nd ref="7"/><nd ref="8"/></way>
+          <way id="1006"><nd ref="9"/><nd ref="10"/></way>
+          <way id="1007"><nd ref="8"/><nd ref="11"/></way>
+          <way id="1008"><nd ref="10"/><nd ref="12"/></way>
+
+          <way id="4001">
+            <nd ref="21"/><nd ref="22"/><nd ref="23"/>
+            <tag k="type" v="traffic_light"/>
+            <tag k="subtype" v="red_green"/>
+          </way>
+          <way id="4002">
+            <nd ref="24"/><nd ref="25"/><nd ref="26"/>
+            <tag k="type" v="traffic_light"/>
+            <tag k="subtype" v="red_green"/>
+          </way>
+          <way id="5001"><nd ref="31"/><nd ref="32"/></way>
+          <way id="5002"><nd ref="33"/><nd ref="34"/></way>
+
+          <relation id="2001">
+            <member type="way" role="left" ref="1001"/>
+            <member type="way" role="right" ref="1002"/>
+            <member type="relation" role="regulatory_element" ref="3001"/>
+            <tag k="type" v="lanelet"/>
+            <tag k="subtype" v="road"/>
+            <tag k="location" v="urban"/>
+            <tag k="one_way" v="yes"/>
+            <tag k="turn_direction" v="straight"/>
+          </relation>
+          <relation id="2002">
+            <member type="way" role="left" ref="1003"/>
+            <member type="way" role="right" ref="1004"/>
+            <tag k="type" v="lanelet"/>
+            <tag k="subtype" v="road"/>
+            <tag k="location" v="urban"/>
+            <tag k="one_way" v="yes"/>
+          </relation>
+          <relation id="2003">
+            <member type="way" role="left" ref="1005"/>
+            <member type="way" role="right" ref="1006"/>
+            <member type="relation" role="regulatory_element" ref="3002"/>
+            <tag k="type" v="lanelet"/>
+            <tag k="subtype" v="road"/>
+            <tag k="location" v="urban"/>
+            <tag k="one_way" v="yes"/>
+            <tag k="turn_direction" v="straight"/>
+          </relation>
+          <relation id="2004">
+            <member type="way" role="left" ref="1007"/>
+            <member type="way" role="right" ref="1008"/>
+            <tag k="type" v="lanelet"/>
+            <tag k="subtype" v="road"/>
+            <tag k="location" v="urban"/>
+            <tag k="one_way" v="yes"/>
+          </relation>
+
+          <relation id="3001">
+            <member type="way" role="refers" ref="4001"/>
+            <member type="way" role="ref_line" ref="5001"/>
+            <tag k="type" v="regulatory_element"/>
+            <tag k="subtype" v="traffic_light"/>
+          </relation>
+          <relation id="3002">
+            <member type="way" role="refers" ref="4002"/>
+            <member type="way" role="ref_line" ref="5002"/>
+            <tag k="type" v="regulatory_element"/>
+            <tag k="subtype" v="traffic_light"/>
+          </relation>
+        </osm>
+        """
+    ).strip()
 
 
 class TestLanelet2ToCommonRoadConversion(unittest.TestCase):
@@ -122,6 +230,29 @@ class TestLanelet2ToCommonRoadConversion(unittest.TestCase):
     def test_map_with_speed_limits(self):
         """Basic test file including speed limits."""
         self.assertTrue(self.compare_maps("traffic_speed_limit_utm"))
+
+    def test_signalized_intersection_uses_incoming_lanelets(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".osm", delete=False) as tmp_file:
+            tmp_file.write(_signalized_intersection_osm_xml())
+            tmp_file_path = tmp_file.name
+
+        try:
+            scenario = self.load_and_convert("unused", file_path=tmp_file_path)
+        finally:
+            os.remove(tmp_file_path)
+
+        self.assertEqual(1, len(scenario.lanelet_network.intersections))
+
+        lanelets_by_description = {
+            str(getattr(lanelet, "description", "")): lanelet for lanelet in scenario.lanelet_network.lanelets
+        }
+        self.assertTrue(lanelets_by_description["2001"].traffic_lights)
+        self.assertTrue(lanelets_by_description["2003"].traffic_lights)
+        self.assertFalse(lanelets_by_description["2002"].traffic_lights)
+        self.assertFalse(lanelets_by_description["2004"].traffic_lights)
+
+        directions = {traffic_light.direction for traffic_light in scenario.lanelet_network.traffic_lights}
+        self.assertIn(TrafficLightDirection.STRAIGHT, directions)
 
     @unittest.skip("there are minor differences between the file at the end of the pipeline")
     def test_geodetic_transformation(self):

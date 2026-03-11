@@ -1003,6 +1003,31 @@ class TestConversionLanelet(unittest.TestCase):
         conversion_lanelet_network.add_stop_lines_to_network([stop_line_1])
         self.assertEqual(stop_line_1, lanelet_1.stop_line)
 
+    def test_find_left_of_handles_two_point_incomings(self):
+        conversion_lanelet_network = ConversionLaneletNetwork()
+
+        lanelet_1 = ConversionLanelet(
+            None,
+            np.array([[-1.0, 1.0], [0.0, 1.0]]),
+            np.array([[-1.0, 0.0], [0.0, 0.0]]),
+            np.array([[-1.0, -1.0], [0.0, -1.0]]),
+            1,
+        )
+        lanelet_2 = ConversionLanelet(
+            None,
+            np.array([[-1.0, -1.0], [-1.0, 0.0]]),
+            np.array([[0.0, -1.0], [0.0, 0.0]]),
+            np.array([[1.0, -1.0], [1.0, 0.0]]),
+            2,
+        )
+
+        add_lanelets_to_network(conversion_lanelet_network, [lanelet_1, lanelet_2])
+
+        incoming_1 = IntersectionIncomingElement(10, {1}, set(), set(), set(), None)
+        incoming_2 = IntersectionIncomingElement(11, {2}, set(), set(), set(), None)
+
+        conversion_lanelet_network.find_left_of([incoming_1, incoming_2])
+
 
 class TestJointSplitTarget(unittest.TestCase):
     def test_init(self):

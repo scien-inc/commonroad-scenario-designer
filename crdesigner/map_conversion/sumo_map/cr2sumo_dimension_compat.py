@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import inspect
 import logging
 
@@ -445,6 +446,7 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
     try:
         from commonroad_sumo.cr2sumo.map_converter import map_converter as cr2sumo_map_converter
         from commonroad_sumo.cr2sumo.map_converter.map_converter import CR2SumoMapConverter
+        from commonroad.scenario.traffic_light import TrafficLightDirection
     except ImportError:
         _LOGGER.debug(
             "commonroad_sumo is not available; skipping CR->SUMO traffic-light compatibility patch."
@@ -466,12 +468,116 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
     original_create_traffic_lights = CR2SumoMapConverter._create_traffic_lights
 
     def create_traffic_lights_safe(self):
+        def required_direction_keys(direction) -> set:
+            if direction in (None, TrafficLightDirection.ALL):
+                return set()
+
+            required = set()
+            if direction in (
+                TrafficLightDirection.RIGHT,
+                TrafficLightDirection.LEFT_RIGHT,
+                TrafficLightDirection.STRAIGHT_RIGHT,
+            ):
+                required.add(TrafficLightDirection.RIGHT)
+            if direction in (
+                TrafficLightDirection.LEFT,
+                TrafficLightDirection.LEFT_RIGHT,
+                TrafficLightDirection.LEFT_STRAIGHT,
+            ):
+                required.add(TrafficLightDirection.LEFT)
+            if direction in (
+                TrafficLightDirection.STRAIGHT,
+                TrafficLightDirection.STRAIGHT_RIGHT,
+                TrafficLightDirection.LEFT_STRAIGHT,
+            ):
+                required.add(TrafficLightDirection.STRAIGHT)
+            return required
+
+        def available_direction_fallback(available_directions: set):
+            available_directions = frozenset(available_directions)
+            direction_map = {
+                frozenset({TrafficLightDirection.LEFT}): TrafficLightDirection.LEFT,
+                frozenset({TrafficLightDirection.RIGHT}): TrafficLightDirection.RIGHT,
+                frozenset({TrafficLightDirection.STRAIGHT}): TrafficLightDirection.STRAIGHT,
+                frozenset(
+                    {TrafficLightDirection.LEFT, TrafficLightDirection.STRAIGHT}
+                ): TrafficLightDirection.LEFT_STRAIGHT,
+                frozenset(
+                    {TrafficLightDirection.STRAIGHT, TrafficLightDirection.RIGHT}
+                ): TrafficLightDirection.STRAIGHT_RIGHT,
+                frozenset(
+                    {TrafficLightDirection.LEFT, TrafficLightDirection.RIGHT}
+                ): TrafficLightDirection.LEFT_RIGHT,
+                frozenset(
+                    {
+                        TrafficLightDirection.LEFT,
+                        TrafficLightDirection.STRAIGHT,
+                        TrafficLightDirection.RIGHT,
+                    }
+                ): TrafficLightDirection.ALL,
+            }
+            return direction_map.get(available_directions)
+
+        def direction_2_connections_for_lanelet(lanelet, edge, intersection):
+            if intersection is not None:
+                incoming_elem = intersection.map_incoming_lanelets[lanelet.lanelet_id]
+                connections_init = {
+                    TrafficLightDirection.STRAIGHT: incoming_elem.successors_straight,
+                    TrafficLightDirection.LEFT: incoming_elem.successors_left,
+                    TrafficLightDirection.RIGHT: incoming_elem.successors_right,
+                }
+            elif len(lanelet.successor) == 1:
+                successor_set = set(lanelet.successor)
+                connections_init = {
+                    TrafficLightDirection.STRAIGHT: successor_set,
+                    TrafficLightDirection.LEFT: successor_set,
+                    TrafficLightDirection.RIGHT: successor_set,
+                }
+            else:
+                return {}
+
+            connections = {}
+            for direction, init_queue in connections_init.items():
+                queue = []
+                for successor_lanelet_id in init_queue:
+                    successor_edge_id = self.lanelet_id2edge_id.get(successor_lanelet_id)
+                    successor_edge = self.edges.get(successor_edge_id)
+                    if successor_edge is not None:
+                        queue.append(successor_edge)
+
+                visited = set()
+                reachable_connections = set()
+                while queue:
+                    current = queue.pop()
+                    current_id = getattr(current, "id", None)
+                    if current_id is None or current_id in visited:
+                        continue
+                    visited.add(current_id)
+
+                    if current_id in self.new_edges:
+                        reachable_connections |= {
+                            connection
+                            for connection in self._new_connections
+                            if connection.from_edge == edge and connection.to_edge == current
+                        }
+                        continue
+
+                    queue.extend(getattr(current, "outgoing", []))
+
+                if reachable_connections:
+                    connections[direction] = reachable_connections
+
+            return connections
+
         incoming_lanelet_2_intersection = self._lanelet_network.map_inc_lanelets_to_intersections
         new_edge_ids = set(self.new_edges.keys())
         temporarily_disabled = []
         temporarily_remapped_lanelet_edges = []
+        temporarily_replaced_lanelet_lights = []
+        temporarily_added_lights = []
         ambiguous_lanelet_ids = []
         removed_lanelet_ids_no_unique_upstream = []
+        downgraded_direction_lanelet_ids = set()
         skipped_ambiguous_successor = 0
         remapped_removed_edges = 0
         skipped_removed_edge_no_unique_upstream = 0
@@ -517,35 +623,97 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
                 self.lanelet_id2edge_id[lanelet.lanelet_id] = replacement_edge_id
                 remapped_removed_edges += 1
 
-        if skipped_ambiguous_successor:
-            _LOGGER.warning(
-                "Skipping traffic-light encoding on %d lanelets with ambiguous successors "
-                "(no intersection mapping and successor count != 1). Example lanelet ids: %s",
-                skipped_ambiguous_successor,
-                ", ".join(ambiguous_lanelet_ids[:10]),
-            )
+            edge = self.new_edges.get(self.lanelet_id2edge_id.get(lanelet.lanelet_id))
+            if edge is None:
+                continue
 
-        if remapped_removed_edges:
-            _LOGGER.info(
-                "Remapped traffic-light lanelets from removed edges to unique upstream surviving edges: %d",
-                remapped_removed_edges,
+            intersection = (
+                incoming_lanelet_2_intersection[lanelet.lanelet_id]
+                if lanelet.lanelet_id in incoming_lanelet_2_intersection
+                else None
             )
+            direction_2_connections = direction_2_connections_for_lanelet(lanelet, edge, intersection)
+            available_directions = set(direction_2_connections.keys())
+            if not available_directions:
+                continue
 
-        if skipped_removed_edge_no_unique_upstream:
-            _LOGGER.warning(
-                "Skipped traffic-light encoding on %d lanelets whose edge was removed and had no "
-                "unique upstream surviving replacement. Example lanelet ids: %s",
-                skipped_removed_edge_no_unique_upstream,
-                ", ".join(removed_lanelet_ids_no_unique_upstream[:10]),
-            )
+            original_lights = set(lanelet.traffic_lights)
+            updated_lights = set(original_lights)
+            lanelet_changed = False
+
+            for traffic_light_id in list(original_lights):
+                traffic_light = self._lanelet_network._traffic_lights.get(traffic_light_id)
+                if traffic_light is None or not getattr(traffic_light, "active", True):
+                    continue
+
+                required_directions = required_direction_keys(getattr(traffic_light, "direction", None))
+                if not required_directions or required_directions.issubset(available_directions):
+                    continue
+
+                fallback_direction = available_direction_fallback(available_directions)
+                if fallback_direction is None:
+                    updated_lights.discard(traffic_light_id)
+                    lanelet_changed = True
+                    downgraded_direction_lanelet_ids.add(str(lanelet.lanelet_id))
+                    continue
+
+                temporary_light = copy.deepcopy(traffic_light)
+                temporary_light_id = max(self._lanelet_network._traffic_lights.keys(), default=0) + 1
+                temporary_light.traffic_light_id = temporary_light_id
+                temporary_light.direction = fallback_direction
+                self._lanelet_network._traffic_lights[temporary_light_id] = temporary_light
+                temporarily_added_lights.append(temporary_light_id)
+
+                updated_lights.discard(traffic_light_id)
+                updated_lights.add(temporary_light_id)
+                lanelet_changed = True
+                downgraded_direction_lanelet_ids.add(str(lanelet.lanelet_id))
+
+            if lanelet_changed:
+                temporarily_replaced_lanelet_lights.append((lanelet, original_lights))
+                lanelet.traffic_lights = updated_lights
+
+        _LOGGER.warning(
+            "Skipping traffic-light encoding on %d lanelets with ambiguous successors "
+            "(no intersection mapping and successor count != 1). Example lanelet ids: %s",
+            skipped_ambiguous_successor,
+            ", ".join(ambiguous_lanelet_ids[:10]) if ambiguous_lanelet_ids else "none",
+        )
+
+        _LOGGER.info(
+            "Remapped traffic-light lanelets from removed edges to unique upstream surviving edges: %d",
+            remapped_removed_edges,
+        )
+
+        _LOGGER.warning(
+            "Skipped traffic-light encoding on %d lanelets whose edge was removed and had no "
+            "unique upstream surviving replacement. Example lanelet ids: %s",
+            skipped_removed_edge_no_unique_upstream,
+            ", ".join(removed_lanelet_ids_no_unique_upstream[:10])
+            if removed_lanelet_ids_no_unique_upstream
+            else "none",
+        )
+
+        _LOGGER.warning(
+            "Adjusted traffic-light directions on %d lanelets whose requested turn buckets were "
+            "not reachable in the generated SUMO graph. Example lanelet ids: %s",
+            len(downgraded_direction_lanelet_ids),
+            ", ".join(sorted(downgraded_direction_lanelet_ids)[:10])
+            if downgraded_direction_lanelet_ids
+            else "none",
+        )
 
         try:
             return original_create_traffic_lights(self)
         finally:
             for lanelet, original_lights in temporarily_disabled:
                 lanelet.traffic_lights = original_lights
+            for lanelet, original_lights in temporarily_replaced_lanelet_lights:
+                lanelet.traffic_lights = original_lights
             for lanelet_id, original_edge_id in temporarily_remapped_lanelet_edges:
                 self.lanelet_id2edge_id[lanelet_id] = original_edge_id
+            for traffic_light_id in temporarily_added_lights:
+                self._lanelet_network._traffic_lights.pop(traffic_light_id, None)
 
     CR2SumoMapConverter._create_traffic_lights = create_traffic_lights_safe
     cr2sumo_map_converter._crdesigner_original_create_traffic_lights = original_create_traffic_lights

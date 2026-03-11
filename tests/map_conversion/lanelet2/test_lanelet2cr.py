@@ -10,6 +10,7 @@ from commonroad.scenario.scenario import GeoTransformation, Location
 from commonroad.scenario.traffic_light import (
     TrafficLight,
     TrafficLightCycleElement,
+    TrafficLightDirection,
     TrafficLightState,
 )
 from commonroad.scenario.traffic_sign import (
@@ -157,6 +158,32 @@ class TestLanelet2CRConverter(unittest.TestCase):
 
         # test if the lanelet networks are equal
         self.assertEqual(scenario.lanelet_network, l2cr.lanelet_network)
+
+    def test_parser_preserves_turn_direction(self):
+        xml = etree.fromstring(
+            """
+            <osm version="0.6">
+              <node id="1" lat="49.0" lon="8.4" />
+              <node id="2" lat="49.0" lon="8.4001" />
+              <node id="3" lat="48.9999" lon="8.4" />
+              <node id="4" lat="48.9999" lon="8.4001" />
+              <way id="11"><nd ref="1"/><nd ref="2"/></way>
+              <way id="12"><nd ref="3"/><nd ref="4"/></way>
+              <relation id="101">
+                <member type="way" role="left" ref="11"/>
+                <member type="way" role="right" ref="12"/>
+                <tag k="type" v="lanelet"/>
+                <tag k="subtype" v="road"/>
+                <tag k="location" v="urban"/>
+                <tag k="one_way" v="yes"/>
+                <tag k="turn_direction" v="right"/>
+              </relation>
+            </osm>
+            """
+        )
+        parsed = Lanelet2Parser(xml).parse()
+        way_relation = next(iter(parsed.way_relations.values()))
+        self.assertEqual("right", way_relation.tag_dict["turn_direction"])
 
     def test_add_closest_traffic_sign_to_lanelet(self):
         # testing the function by creating a list of lanelets and a list of signs and checking the result
@@ -713,21 +740,14 @@ class TestLanelet2CRConverter(unittest.TestCase):
         tl_way = Way(
             1, list(osm.nodes)[0:3], {"type": "traffic_light", "subtype": "red_yellow_green"}
         )
-        tl_way_relation = RegulatoryElement(
-            2, refers=list("1"), tag_dict={"subtype": "traffic_light", "type": "regulatory_element"}
-        )
-        osm.add_way(tl_way)
-        osm.add_regulatory_element(tl_way_relation)
-
-        # compare the number of traffic lights before and after the function
         tl_before = len(l2cr.lanelet_network.traffic_lights)
-        l2cr.traffic_light_conversion(tl_way, map)
+        traffic_light = l2cr.traffic_light_conversion(
+            tl_way, map, direction=TrafficLightDirection.RIGHT
+        )
         tl_after = len(l2cr.lanelet_network.traffic_lights)
-        self.assertEqual(tl_before + 1, tl_after)
+        self.assertEqual(tl_before, tl_after)
 
         # check the cycle of the converted traffic light
-        traffic_light: TrafficLight = l2cr.lanelet_network.traffic_lights[0]
-
         first_color = traffic_light.traffic_light_cycle.cycle_elements[0].state.value
         first_duration = traffic_light.traffic_light_cycle.cycle_elements[0].duration
         self.assertEqual(first_color, "red")
@@ -742,6 +762,7 @@ class TestLanelet2CRConverter(unittest.TestCase):
         third_duration = traffic_light.traffic_light_cycle.cycle_elements[2].duration
         self.assertEqual(third_color, "green")
         self.assertEqual(third_duration, 5)
+        self.assertEqual(TrafficLightDirection.RIGHT, traffic_light.direction)
 
     def test_traffic_light_conversion_autoware(self):
         # set autoware flag
@@ -752,16 +773,9 @@ class TestLanelet2CRConverter(unittest.TestCase):
         tl_way = Way(
             1, list(osm.nodes)[0:3], {"type": "traffic_light", "subtype": "red_yellow_green"}
         )
-        tl_way_relation = RegulatoryElement(
-            2, refers=list("1"), tag_dict={"subtype": "traffic_light", "type": "regulatory_element"}
-        )
-        osm.add_way(tl_way)
-        osm.add_regulatory_element(tl_way_relation)
-
-        l2cr.traffic_light_conversion(tl_way, map)
+        traffic_light = l2cr.traffic_light_conversion(tl_way, map)
 
         # test that the id of the traffic light is retained after conversion
-        traffic_light: TrafficLight = l2cr.lanelet_network.traffic_lights[0]
         tl_after_id = int(traffic_light.traffic_light_id)
         self.assertEqual(tl_after_id, 1)
 
@@ -776,6 +790,16 @@ class TestLanelet2CRConverter(unittest.TestCase):
 
         # reset autoware flag
         self._config.autoware = False
+
+    def test_derive_direction_from_turn_tags(self):
+        l2cr = Lanelet2CRConverter()
+        self.assertEqual(
+            TrafficLightDirection.STRAIGHT_RIGHT,
+            l2cr._derive_direction_from_turn_tags({"right;straight"}),
+        )
+        self.assertIsNone(
+            l2cr._derive_direction_from_turn_tags({"left", "straight", "right"})
+        )
 
     def test_speed_limit_conversion(self):
         l2cr = Lanelet2CRConverter()
