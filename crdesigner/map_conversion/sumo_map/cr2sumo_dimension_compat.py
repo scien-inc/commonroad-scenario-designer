@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import copy
+from collections import defaultdict
 import inspect
 import logging
+import os
 
 import numpy as np
 
@@ -14,6 +15,12 @@ _TL_PATCH_FLAG = "_crdesigner_tl_patch_applied"
 _TL_PATCHED_ONCE = False
 _LANE_GROUP_PATCH_FLAG = "_crdesigner_lane_group_patch_applied"
 _LANE_GROUP_PATCHED_ONCE = False
+_NETCONVERT_TLS_PATCH_FLAG = "_crdesigner_netconvert_tls_patch_applied"
+_NETCONVERT_TLS_PATCHED_ONCE = False
+
+_JP_DEFAULT_GREEN_DURATION = 50.0
+_JP_DEFAULT_YELLOW_DURATION = 10.0
+_JP_DEFAULT_ALL_RED_DURATION = 5.0
 
 
 def _vertex_dimension(vertices: np.ndarray) -> int:
@@ -219,16 +226,6 @@ def _needs_traffic_light_patch() -> bool:
     return "calc_direction_2_connections" in source and "raise ValueError" in source
 
 
-def _empty_container_like(values):
-    if isinstance(values, list):
-        return []
-    if isinstance(values, tuple):
-        return tuple()
-    if isinstance(values, set):
-        return set()
-    return set()
-
-
 def _normalized_member_values(values) -> tuple[str, ...]:
     if not values:
         return tuple()
@@ -377,6 +374,194 @@ def apply_commonroad_sumo_lane_grouping_patch() -> bool:
     return True
 
 
+def _needs_netconvert_tls_patch(map_converter_module) -> bool:
+    """Return True if installed commonroad_sumo still lets netconvert guess/group signals."""
+    try:
+        from commonroad_sumo.cr2sumo.map_converter.map_converter import CR2SumoMapConverter
+
+        source = inspect.getsource(CR2SumoMapConverter.merge_intermediate_files)
+        convert_function = getattr(
+            map_converter_module, "convert_intermediate_sumo_project_with_netconvert", None
+        )
+        if convert_function is not None:
+            source += inspect.getsource(convert_function)
+    except (ImportError, OSError, TypeError):
+        return True
+
+    if "--tls.guess-signals=true" in source or "--tls.group-signals=true" in source:
+        return True
+    return "--tllogic-files=" not in source
+
+
+def _log_netconvert_output(netconvert_result: str) -> None:
+    for line in netconvert_result.splitlines():
+        if line.startswith("Warning"):
+            warning_message = line.lstrip("Warning: ")
+            _LOGGER.debug(
+                "netconvert produced a warning while converting network: %s",
+                warning_message,
+            )
+        else:
+            _LOGGER.debug("netconvert output: %s", line)
+
+
+def apply_commonroad_sumo_netconvert_tls_patch() -> bool:
+    """
+    Patch commonroad_sumo netconvert handoff so explicit TLLOGIC files win over guessed signals.
+
+    Returns:
+        True if patching was applied during this call, False otherwise.
+    """
+    global _NETCONVERT_TLS_PATCHED_ONCE
+
+    if _NETCONVERT_TLS_PATCHED_ONCE:
+        return False
+
+    try:
+        from commonroad_sumo.cr2sumo.map_converter import map_converter as cr2sumo_map_converter
+        from commonroad_sumo.cr2sumo.map_converter.map_converter import CR2SumoMapConverter
+    except ImportError:
+        _LOGGER.debug(
+            "commonroad_sumo is not available; skipping CR->SUMO netconvert TLLOGIC patch."
+        )
+        return False
+
+    if getattr(cr2sumo_map_converter, _NETCONVERT_TLS_PATCH_FLAG, False):
+        _NETCONVERT_TLS_PATCHED_ONCE = True
+        return False
+
+    if not _needs_netconvert_tls_patch(cr2sumo_map_converter):
+        setattr(cr2sumo_map_converter, _NETCONVERT_TLS_PATCH_FLAG, True)
+        _NETCONVERT_TLS_PATCHED_ONCE = True
+        _LOGGER.debug(
+            "commonroad_sumo netconvert handoff already appears TLLOGIC-aware; no patch needed."
+        )
+        return False
+
+    original_merge_intermediate_files = CR2SumoMapConverter.merge_intermediate_files
+    original_convert_intermediate = getattr(
+        cr2sumo_map_converter, "convert_intermediate_sumo_project_with_netconvert", None
+    )
+
+    def _common_tls_arguments(sumo_intermediate_project, sumo_project):
+        args = [
+            "--tls.guess-signals=false",
+            "--tls.group-signals=false",
+            "--offset.disable-normalization=true",
+            f"--node-files={sumo_intermediate_project.get_file_path(cr2sumo_map_converter.SumoIntermediateFileType.NODES)}",
+            f"--edge-files={sumo_intermediate_project.get_file_path(cr2sumo_map_converter.SumoIntermediateFileType.EDGES)}",
+            f"--connection-files={sumo_intermediate_project.get_file_path(cr2sumo_map_converter.SumoIntermediateFileType.CONNECTIONS)}",
+            f"--tllogic-files={sumo_intermediate_project.get_file_path(cr2sumo_map_converter.SumoIntermediateFileType.TLLOGICS)}",
+            f"--output-file={sumo_project.get_file_path(cr2sumo_map_converter.SumoFileType.NET)}",
+        ]
+
+        try:
+            args.insert(
+                -1,
+                f"--type-files={sumo_intermediate_project.get_file_path(cr2sumo_map_converter.SumoIntermediateFileType.TYPES)}",
+            )
+        except Exception:
+            pass
+
+        return args
+
+    def merge_intermediate_files_with_explicit_tllogic(
+        self,
+        sumo_intermediate_project,
+        cleanup: bool,
+    ):
+        sumo_project = cr2sumo_map_converter.SumoProject.from_intermediate_sumo_project(
+            sumo_intermediate_project
+        )
+        args = [
+            "--no-turnarounds=true",
+            "--junctions.internal-link-detail=20",
+            "--geometry.avoid-overlap=true",
+            "--geometry.remove.keep-edges.explicit=true",
+            "--geometry.remove.min-length=0.0",
+            *_common_tls_arguments(sumo_intermediate_project, sumo_project),
+        ]
+        random_seed = getattr(getattr(self, "_conf", None), "random_seed", None)
+        if random_seed is not None:
+            args.append(f"--seed={random_seed}")
+
+        netconvert_result = cr2sumo_map_converter.execute_sumo_application(
+            cr2sumo_map_converter.SumoApplication.NETCONVERT,
+            args,
+        )
+        if netconvert_result is None:
+            cr2sumo_map_converter._LOGGER.error(
+                "Failed to merge intermediate files: netconvert failed with an unknown error!"
+            )
+            return None
+
+        _log_netconvert_output(netconvert_result)
+
+        if cleanup:
+            sumo_intermediate_project.cleanup()
+
+        return sumo_project
+
+    def convert_intermediate_sumo_project_with_explicit_tllogic(
+        sumo_intermediate_project,
+        cleanup: bool,
+    ):
+        sumo_project = cr2sumo_map_converter.SumoProject.from_intermediate_sumo_project(
+            sumo_intermediate_project
+        )
+        args = [
+            "--no-turnarounds=true",
+            "--junctions.join=true",
+            "--junctions.join-dist=20",
+            "--junctions.join-same=true",
+            "--junctions.join-turns=true",
+            "--junctions.scurve-stretch=5.0",
+            "--junctions.internal-link-detail=20",
+            "--junctions.corner-detail=20",
+            "--junctions.endpoint-shape=true",
+            "--edges.join=true",
+            "--ramps.guess=true",
+            "--plain.extend-edge-shape=true",
+            "--geometry.avoid-overlap=true",
+            "--geometry.remove.min-length=5.0",
+            "--fringe.guess=true",
+            *_common_tls_arguments(sumo_intermediate_project, sumo_project),
+        ]
+
+        netconvert_result = cr2sumo_map_converter.execute_sumo_application(
+            cr2sumo_map_converter.SumoApplication.NETCONVERT,
+            args,
+        )
+        if netconvert_result is None:
+            cr2sumo_map_converter._LOGGER.error(
+                "Failed to merge intermediate files: netconvert failed with an unknown error!"
+            )
+            return None
+
+        _log_netconvert_output(netconvert_result)
+
+        if cleanup:
+            sumo_intermediate_project.cleanup()
+
+        return sumo_project
+
+    CR2SumoMapConverter.merge_intermediate_files = merge_intermediate_files_with_explicit_tllogic
+    cr2sumo_map_converter._crdesigner_original_merge_intermediate_files = (
+        original_merge_intermediate_files
+    )
+    if original_convert_intermediate is not None:
+        cr2sumo_map_converter.convert_intermediate_sumo_project_with_netconvert = (
+            convert_intermediate_sumo_project_with_explicit_tllogic
+        )
+        cr2sumo_map_converter._crdesigner_original_convert_intermediate_sumo_project = (
+            original_convert_intermediate
+        )
+    setattr(cr2sumo_map_converter, _NETCONVERT_TLS_PATCH_FLAG, True)
+    _NETCONVERT_TLS_PATCHED_ONCE = True
+    _LOGGER.info("Applied commonroad_sumo CR->SUMO netconvert TLLOGIC compatibility patch.")
+    return True
+
+
 def _collect_reachable_new_edge_ids(start_edges, new_edge_ids, next_attr: str) -> set[int]:
     """Traverse edge graph and collect reachable edge IDs that survived in new_edges."""
     queue = list(start_edges)
@@ -427,6 +612,229 @@ def _find_unique_upstream_replacement_edge_id(
     return next(iter(reachable_upstream_new_edges))
 
 
+def _connection_sort_key(connection) -> tuple:
+    from_edge_id = getattr(getattr(connection, "from_edge", None), "id", -1)
+    to_edge_id = getattr(getattr(connection, "to_edge", None), "id", -1)
+    via_identifier = getattr(connection, "via", None) or getattr(connection, "via_id", None) or ""
+    shape = getattr(connection, "shape", None)
+    shape_key = ()
+    if isinstance(shape, np.ndarray) and shape.ndim == 2 and len(shape) >= 1:
+        shape_key = tuple(shape[0].tolist()) + tuple(shape[-1].tolist())
+    return from_edge_id, to_edge_id, str(via_identifier), shape_key
+
+
+def _incoming_direction_vector(lanelet_network, incoming_element) -> np.ndarray:
+    incoming_lanelet_ids = sorted(getattr(incoming_element, "incoming_lanelets", []) or [])
+    if not incoming_lanelet_ids:
+        return np.array([1.0, 0.0])
+
+    lanelet = lanelet_network.find_lanelet_by_id(incoming_lanelet_ids[0])
+    if lanelet is None or len(getattr(lanelet, "center_vertices", [])) < 2:
+        return np.array([1.0, 0.0])
+
+    end_vertex = lanelet.center_vertices[-1][:2]
+    start_index = -3 if len(lanelet.center_vertices) >= 3 else -2
+    start_vertex = lanelet.center_vertices[start_index][:2]
+    direction = end_vertex - start_vertex
+    if np.linalg.norm(direction) == 0:
+        return np.array([1.0, 0.0])
+    return direction
+
+
+def _incoming_angle_degrees(lanelet_network, incoming_element) -> float:
+    direction = _incoming_direction_vector(lanelet_network, incoming_element)
+    return float(np.degrees(np.arctan2(direction[1], direction[0])))
+
+
+def _circular_angle_difference_degrees(first_angle: float, second_angle: float) -> float:
+    difference = abs(first_angle - second_angle) % 360.0
+    return difference if difference <= 180.0 else 360.0 - difference
+
+
+def _build_japanese_default_phase_groups(lanelet_network, incoming_elements_by_id) -> list[list[int]]:
+    if not incoming_elements_by_id:
+        return []
+
+    angles = {
+        incoming_id: _incoming_angle_degrees(lanelet_network, incoming_element)
+        for incoming_id, incoming_element in incoming_elements_by_id.items()
+    }
+    unused_incoming_ids = set(incoming_elements_by_id.keys())
+    phase_groups: list[list[int]] = []
+
+    while unused_incoming_ids:
+        base_incoming_id = min(unused_incoming_ids, key=lambda incoming_id: angles[incoming_id])
+        unused_incoming_ids.remove(base_incoming_id)
+
+        opposite_incoming_id = None
+        opposite_score = None
+        for candidate_incoming_id in sorted(unused_incoming_ids):
+            angle_difference = _circular_angle_difference_degrees(
+                angles[base_incoming_id], angles[candidate_incoming_id]
+            )
+            score = abs(180.0 - angle_difference)
+            if score > 45.0:
+                continue
+            if opposite_score is None or score < opposite_score:
+                opposite_incoming_id = candidate_incoming_id
+                opposite_score = score
+
+        phase_group = [base_incoming_id]
+        if opposite_incoming_id is not None:
+            unused_incoming_ids.remove(opposite_incoming_id)
+            phase_group.append(opposite_incoming_id)
+
+        phase_group.sort(key=lambda incoming_id: (angles[incoming_id], incoming_id))
+        phase_groups.append(phase_group)
+
+    phase_groups.sort(key=lambda group: min(angles[incoming_id] for incoming_id in group))
+    return phase_groups
+
+
+def _shape_based_conflict(connection_a, connection_b, lines_intersect, curvature_fn) -> tuple[bool, bool]:
+    shape_a = getattr(connection_a, "shape", None)
+    shape_b = getattr(connection_b, "shape", None)
+    if not (
+        isinstance(shape_a, np.ndarray)
+        and shape_a.ndim == 2
+        and len(shape_a) >= 2
+        and isinstance(shape_b, np.ndarray)
+        and shape_b.ndim == 2
+        and len(shape_b) >= 2
+    ):
+        return False, False
+
+    if not lines_intersect(shape_a, shape_b):
+        return False, False
+
+    direction_dot = np.dot(shape_a[-1] - shape_a[0], shape_b[-1] - shape_b[0])
+    if direction_dot >= 0:
+        return False, False
+
+    return True, curvature_fn(shape_a) <= curvature_fn(shape_b)
+
+
+def _build_japanese_default_green_state(
+    ordered_connections,
+    active_indices: list[int],
+    signal_state_enum,
+    lines_intersect,
+    curvature_fn,
+):
+    state = [signal_state_enum.RED] * len(ordered_connections)
+    for active_index in active_indices:
+        state[active_index] = signal_state_enum.GREEN
+
+    for left_pos, left_index in enumerate(active_indices):
+        for right_index in active_indices[left_pos + 1 :]:
+            conflicts, left_has_priority = _shape_based_conflict(
+                ordered_connections[left_index],
+                ordered_connections[right_index],
+                lines_intersect,
+                curvature_fn,
+            )
+            if not conflicts:
+                continue
+            if left_has_priority:
+                state[left_index] = signal_state_enum.GREEN_PRIORITY
+                state[right_index] = signal_state_enum.GREEN
+            else:
+                state[left_index] = signal_state_enum.GREEN
+                state[right_index] = signal_state_enum.GREEN_PRIORITY
+
+    return state
+
+
+def _build_uniform_state(length: int, active_indices: list[int], active_state, inactive_state):
+    state = [inactive_state] * length
+    for active_index in active_indices:
+        state[active_index] = active_state
+    return state
+
+
+def _build_japanese_default_tls_program(
+    lanelet_network,
+    node,
+    incoming_connections_by_id,
+    incoming_elements_by_id,
+    tls_program_cls,
+    phase_cls,
+    signal_state_enum,
+    node_type_enum,
+    lines_intersect,
+    curvature_fn,
+):
+    ordered_connections = sorted(
+        {
+            connection
+            for connections in incoming_connections_by_id.values()
+            for connection in connections
+        },
+        key=_connection_sort_key,
+    )
+    if not ordered_connections:
+        return None, []
+
+    node.type = node_type_enum.TRAFFIC_LIGHT
+    tls_program = tls_program_cls(str(node.id), offset=0, program_id=f"jp_default_{node.id}")
+    connection_indices = {
+        connection: index for index, connection in enumerate(ordered_connections)
+    }
+
+    for phase_group in _build_japanese_default_phase_groups(
+        lanelet_network, incoming_elements_by_id
+    ):
+        active_indices = sorted(
+            {
+                connection_indices[connection]
+                for incoming_id in phase_group
+                for connection in incoming_connections_by_id.get(incoming_id, set())
+                if connection in connection_indices
+            }
+        )
+        if not active_indices:
+            continue
+
+        tls_program.add_phase(
+            phase_cls(
+                _JP_DEFAULT_GREEN_DURATION,
+                _build_japanese_default_green_state(
+                    ordered_connections,
+                    active_indices,
+                    signal_state_enum,
+                    lines_intersect,
+                    curvature_fn,
+                ),
+            )
+        )
+        tls_program.add_phase(
+            phase_cls(
+                _JP_DEFAULT_YELLOW_DURATION,
+                _build_uniform_state(
+                    len(ordered_connections),
+                    active_indices,
+                    signal_state_enum.YELLOW,
+                    signal_state_enum.RED,
+                ),
+            )
+        )
+        tls_program.add_phase(
+            phase_cls(
+                _JP_DEFAULT_ALL_RED_DURATION,
+                [signal_state_enum.RED] * len(ordered_connections),
+            )
+        )
+
+    if not tls_program.phases:
+        return None, []
+
+    for index, connection in enumerate(ordered_connections):
+        connection.tls = tls_program
+        connection.tl_link = index
+
+    return tls_program, ordered_connections
+
+
 def apply_commonroad_sumo_traffic_light_patch() -> bool:
     """
     Patch commonroad_sumo CR->SUMO traffic-light conversion to tolerate ambiguous lanelet successors.
@@ -446,6 +854,14 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
     try:
         from commonroad_sumo.cr2sumo.map_converter import map_converter as cr2sumo_map_converter
         from commonroad_sumo.cr2sumo.map_converter.map_converter import CR2SumoMapConverter
+        from commonroad_sumo.cr2sumo.map_converter.traffic_light import (
+            Phase as TrafficLightPhase,
+            SignalState as TrafficLightSignalState,
+            TLSProgram as TrafficLightTLSProgram,
+            compute_max_curvature_from_polyline,
+            lines_intersect,
+        )
+        from commonroad_sumo.sumolib.net import NodeType
         from commonroad.scenario.traffic_light import TrafficLightDirection
     except ImportError:
         _LOGGER.debug(
@@ -457,17 +873,16 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
         _TL_PATCHED_ONCE = True
         return False
 
-    if not _needs_traffic_light_patch():
-        setattr(cr2sumo_map_converter, _TL_PATCH_FLAG, True)
-        _TL_PATCHED_ONCE = True
-        _LOGGER.debug(
-            "commonroad_sumo traffic-light conversion already handles ambiguous successors; no patch needed."
-        )
-        return False
-
     original_create_traffic_lights = CR2SumoMapConverter._create_traffic_lights
 
     def create_traffic_lights_safe(self):
+        cr_traffic_lights = self._lanelet_network._traffic_lights
+        debug_tl_nodes = {
+            node_id.strip()
+            for node_id in os.environ.get("CRDESIGNER_DEBUG_TL_NODES", "").split(",")
+            if node_id.strip()
+        }
+
         def required_direction_keys(direction) -> set:
             if direction in (None, TrafficLightDirection.ALL):
                 return set()
@@ -517,6 +932,48 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
                 ): TrafficLightDirection.ALL,
             }
             return direction_map.get(available_directions)
+
+        def select_connections_for_light(lanelet, light, direction_2_connections, available_directions):
+            if (
+                len(lanelet.successor) == 1
+                or not light.direction
+                or light.direction == TrafficLightDirection.ALL
+            ):
+                return set().union(*direction_2_connections.values()) if direction_2_connections else set()
+
+            required_directions = required_direction_keys(light.direction)
+            if not required_directions or required_directions.issubset(available_directions):
+                selected_directions = required_directions or available_directions
+            else:
+                fallback_direction = available_direction_fallback(available_directions)
+                if fallback_direction is None:
+                    downgraded_direction_lanelet_ids.add(str(lanelet.lanelet_id))
+                    return set()
+                selected_directions = required_direction_keys(fallback_direction)
+                downgraded_direction_lanelet_ids.add(str(lanelet.lanelet_id))
+
+            connections = set()
+            for direction in selected_directions:
+                connections |= direction_2_connections.get(direction, set())
+            return connections
+
+        def normalize_group_state(states):
+            state_set = set(states)
+            if TrafficLightSignalState.GREEN_PRIORITY in state_set:
+                return TrafficLightSignalState.GREEN_PRIORITY
+            if TrafficLightSignalState.GREEN in state_set:
+                return TrafficLightSignalState.GREEN
+            if TrafficLightSignalState.GREEN_TURN_RIGHT in state_set:
+                return TrafficLightSignalState.GREEN_TURN_RIGHT
+            if TrafficLightSignalState.YELLOW in state_set:
+                return TrafficLightSignalState.YELLOW
+            if TrafficLightSignalState.RED_YELLOW in state_set:
+                return TrafficLightSignalState.RED_YELLOW
+            if TrafficLightSignalState.BLINKING in state_set:
+                return TrafficLightSignalState.BLINKING
+            if TrafficLightSignalState.NO_SIGNAL in state_set:
+                return TrafficLightSignalState.NO_SIGNAL
+            return TrafficLightSignalState.RED
 
         def direction_2_connections_for_lanelet(lanelet, edge, intersection):
             if intersection is not None:
@@ -571,10 +1028,11 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
 
         incoming_lanelet_2_intersection = self._lanelet_network.map_inc_lanelets_to_intersections
         new_edge_ids = set(self.new_edges.keys())
-        temporarily_disabled = []
-        temporarily_remapped_lanelet_edges = []
-        temporarily_replaced_lanelet_lights = []
-        temporarily_added_lights = []
+        node_key_2_node = {}
+        node_2_traffic_light = defaultdict(set)
+        light_2_connections = defaultdict(set)
+        node_2_incoming_connections = defaultdict(lambda: defaultdict(set))
+        node_2_incoming_elements = defaultdict(dict)
         ambiguous_lanelet_ids = []
         removed_lanelet_ids_no_unique_upstream = []
         downgraded_direction_lanelet_ids = set()
@@ -591,18 +1049,12 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
                 lanelet.lanelet_id not in incoming_lanelet_2_intersection
                 and len(lanelet.successor) != 1
             ):
-                original_lights = lanelet.traffic_lights
-                temporarily_disabled.append((lanelet, original_lights))
-                lanelet.traffic_lights = _empty_container_like(original_lights)
                 skipped_ambiguous_successor += 1
                 ambiguous_lanelet_ids.append(str(lanelet.lanelet_id))
                 continue
 
             lanelet_edge_id = self.lanelet_id2edge_id.get(lanelet.lanelet_id)
             if lanelet_edge_id is None:
-                original_lights = lanelet.traffic_lights
-                temporarily_disabled.append((lanelet, original_lights))
-                lanelet.traffic_lights = _empty_container_like(original_lights)
                 skipped_removed_edge_no_unique_upstream += 1
                 removed_lanelet_ids_no_unique_upstream.append(str(lanelet.lanelet_id))
                 continue
@@ -612,18 +1064,14 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
                     self, lanelet_edge_id, new_edge_ids
                 )
                 if replacement_edge_id is None:
-                    original_lights = lanelet.traffic_lights
-                    temporarily_disabled.append((lanelet, original_lights))
-                    lanelet.traffic_lights = _empty_container_like(original_lights)
                     skipped_removed_edge_no_unique_upstream += 1
                     removed_lanelet_ids_no_unique_upstream.append(str(lanelet.lanelet_id))
                     continue
 
-                temporarily_remapped_lanelet_edges.append((lanelet.lanelet_id, lanelet_edge_id))
-                self.lanelet_id2edge_id[lanelet.lanelet_id] = replacement_edge_id
+                lanelet_edge_id = replacement_edge_id
                 remapped_removed_edges += 1
 
-            edge = self.new_edges.get(self.lanelet_id2edge_id.get(lanelet.lanelet_id))
+            edge = self.new_edges.get(lanelet_edge_id)
             if edge is None:
                 continue
 
@@ -637,41 +1085,48 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
             if not available_directions:
                 continue
 
-            original_lights = set(lanelet.traffic_lights)
-            updated_lights = set(original_lights)
-            lanelet_changed = False
+            node = edge.to_node
+            node_key = getattr(node, "id", None)
+            if node_key is None:
+                node_key = id(node)
+            node_key_2_node[node_key] = node
+            active_traffic_lights = [
+                cr_traffic_lights[traffic_light_id]
+                for traffic_light_id in set(lanelet.traffic_lights)
+                if traffic_light_id in cr_traffic_lights
+                and getattr(cr_traffic_lights[traffic_light_id], "active", True)
+            ]
+            if not active_traffic_lights:
+                continue
 
-            for traffic_light_id in list(original_lights):
-                traffic_light = self._lanelet_network._traffic_lights.get(traffic_light_id)
-                if traffic_light is None or not getattr(traffic_light, "active", True):
+            if intersection is not None:
+                incoming_elem = intersection.map_incoming_lanelets.get(lanelet.lanelet_id)
+                if incoming_elem is not None:
+                    incoming_connections = (
+                        set().union(*direction_2_connections.values())
+                        if direction_2_connections
+                        else set()
+                    )
+                    if incoming_connections:
+                        node_2_incoming_connections[node_key][incoming_elem.incoming_id] |= (
+                            incoming_connections
+                        )
+                        node_2_incoming_elements[node_key][incoming_elem.incoming_id] = incoming_elem
+                        continue
+
+            for traffic_light_id in set(lanelet.traffic_lights):
+                traffic_light = cr_traffic_lights.get(traffic_light_id)
+                if traffic_light is None or traffic_light not in active_traffic_lights:
                     continue
 
-                required_directions = required_direction_keys(getattr(traffic_light, "direction", None))
-                if not required_directions or required_directions.issubset(available_directions):
+                connections = select_connections_for_light(
+                    lanelet, traffic_light, direction_2_connections, available_directions
+                )
+                if not connections:
                     continue
 
-                fallback_direction = available_direction_fallback(available_directions)
-                if fallback_direction is None:
-                    updated_lights.discard(traffic_light_id)
-                    lanelet_changed = True
-                    downgraded_direction_lanelet_ids.add(str(lanelet.lanelet_id))
-                    continue
-
-                temporary_light = copy.deepcopy(traffic_light)
-                temporary_light_id = max(self._lanelet_network._traffic_lights.keys(), default=0) + 1
-                temporary_light.traffic_light_id = temporary_light_id
-                temporary_light.direction = fallback_direction
-                self._lanelet_network._traffic_lights[temporary_light_id] = temporary_light
-                temporarily_added_lights.append(temporary_light_id)
-
-                updated_lights.discard(traffic_light_id)
-                updated_lights.add(temporary_light_id)
-                lanelet_changed = True
-                downgraded_direction_lanelet_ids.add(str(lanelet.lanelet_id))
-
-            if lanelet_changed:
-                temporarily_replaced_lanelet_lights.append((lanelet, original_lights))
-                lanelet.traffic_lights = updated_lights
+                node_2_traffic_light[node_key].add(traffic_light)
+                light_2_connections[traffic_light] |= connections
 
         _LOGGER.warning(
             "Skipping traffic-light encoding on %d lanelets with ambiguous successors "
@@ -703,17 +1158,90 @@ def apply_commonroad_sumo_traffic_light_patch() -> bool:
             else "none",
         )
 
-        try:
-            return original_create_traffic_lights(self)
-        finally:
-            for lanelet, original_lights in temporarily_disabled:
-                lanelet.traffic_lights = original_lights
-            for lanelet, original_lights in temporarily_replaced_lanelet_lights:
-                lanelet.traffic_lights = original_lights
-            for lanelet_id, original_edge_id in temporarily_remapped_lanelet_edges:
-                self.lanelet_id2edge_id[lanelet_id] = original_edge_id
-            for traffic_light_id in temporarily_added_lights:
-                self._lanelet_network._traffic_lights.pop(traffic_light_id, None)
+        encoder = cr2sumo_map_converter.TrafficLightEncoder(self._scenario.dt)
+        for node_key, incoming_connections_by_id in node_2_incoming_connections.items():
+            to_node = node_key_2_node[node_key]
+            program, connections = _build_japanese_default_tls_program(
+                self._lanelet_network,
+                to_node,
+                incoming_connections_by_id,
+                node_2_incoming_elements[node_key],
+                TrafficLightTLSProgram,
+                TrafficLightPhase,
+                TrafficLightSignalState,
+                NodeType,
+                lines_intersect,
+                compute_max_curvature_from_polyline,
+            )
+            if program is None:
+                continue
+            if str(getattr(to_node, "id", "")) in debug_tl_nodes:
+                _LOGGER.warning(
+                    "TL debug japanese-default node=%s incoming_groups=%s phases=%s",
+                    getattr(to_node, "id", "unknown"),
+                    {
+                        incoming_id: len(connections_set)
+                        for incoming_id, connections_set in incoming_connections_by_id.items()
+                    },
+                    ["".join(signal.value for signal in phase.state) for phase in program.phases],
+                )
+            self.traffic_light_signals.add_program(program)
+            for connection in connections:
+                self.traffic_light_signals.add_connection(connection)
+
+        for node_key, lights in node_2_traffic_light.items():
+            if node_key in node_2_incoming_connections:
+                continue
+            to_node = node_key_2_node[node_key]
+            ordered_lights = sorted(
+                (light for light in lights if light_2_connections.get(light)),
+                key=lambda light: light.traffic_light_id,
+            )
+            if not ordered_lights:
+                continue
+            try:
+                program, connections = encoder.encode(
+                    to_node,
+                    ordered_lights,
+                    {light: light_2_connections[light] for light in ordered_lights},
+                )
+                if str(getattr(to_node, "id", "")) in debug_tl_nodes:
+                    _LOGGER.warning(
+                        "TL debug before normalize node=%s lights=%s connection_counts=%s phases=%s",
+                        getattr(to_node, "id", "unknown"),
+                        [light.traffic_light_id for light in ordered_lights],
+                        {
+                            light.traffic_light_id: len(light_2_connections[light])
+                            for light in ordered_lights
+                        },
+                        ["".join(signal.value for signal in phase.state) for phase in program.phases],
+                    )
+                connection_indices = {connection: idx for idx, connection in enumerate(connections)}
+                for light in ordered_lights:
+                    indices = sorted(
+                        connection_indices[connection]
+                        for connection in light_2_connections[light]
+                        if connection in connection_indices
+                    )
+                    if len(indices) <= 1:
+                        continue
+                    for phase in program.phases:
+                        normalized_state = normalize_group_state(
+                            [phase.state[idx] for idx in indices]
+                        )
+                        for idx in indices:
+                            phase.state[idx] = normalized_state
+                if str(getattr(to_node, "id", "")) in debug_tl_nodes:
+                    _LOGGER.warning(
+                        "TL debug after normalize node=%s phases=%s",
+                        getattr(to_node, "id", "unknown"),
+                        ["".join(signal.value for signal in phase.state) for phase in program.phases],
+                    )
+                self.traffic_light_signals.add_program(program)
+                for connection in connections:
+                    self.traffic_light_signals.add_connection(connection)
+            except (RuntimeError, ValueError, TypeError):
+                continue
 
     CR2SumoMapConverter._create_traffic_lights = create_traffic_lights_safe
     cr2sumo_map_converter._crdesigner_original_create_traffic_lights = original_create_traffic_lights

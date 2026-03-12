@@ -872,29 +872,25 @@ class ConversionLaneletNetwork(LaneletNetwork):
             intersection_incoming_set = list()
             incoming_lane = self.find_lanelet_by_id(incoming_lane_id)
             intersection_incoming_set.append(incoming_lane_id)
-            adj_right = incoming_lane.adj_right
-            adj_left = incoming_lane.adj_left
-            while adj_right is not None:
-                if adj_right in incoming_lane_ids:
-                    adj_right_lane = self.find_lanelet_by_id(adj_right)
-                    if adj_right_lane.adj_right_same_direction:
-                        intersection_incoming_set.append(adj_right)
-                        adj_right = adj_right_lane.adj_right
-                    else:
-                        adj_right = None
-                else:
-                    adj_right = None
+            current_lane = incoming_lane
+            while current_lane.adj_right is not None:
+                adj_right = current_lane.adj_right
+                if adj_right not in incoming_lane_ids or not current_lane.adj_right_same_direction:
+                    break
+                intersection_incoming_set.append(adj_right)
+                current_lane = self.find_lanelet_by_id(adj_right)
+                if current_lane is None:
+                    break
 
-            while adj_left is not None:
-                if adj_left in incoming_lane_ids:
-                    adj_left_lane = self.find_lanelet_by_id(adj_left)
-                    if adj_left_lane.adj_left_same_direction:
-                        intersection_incoming_set.append(adj_left)
-                        adj_left = adj_left_lane.adj_left
-                    else:
-                        adj_left = None
-                else:
-                    adj_left = None
+            current_lane = incoming_lane
+            while current_lane.adj_left is not None:
+                adj_left = current_lane.adj_left
+                if adj_left not in incoming_lane_ids or not current_lane.adj_left_same_direction:
+                    break
+                intersection_incoming_set.append(adj_left)
+                current_lane = self.find_lanelet_by_id(adj_left)
+                if current_lane is None:
+                    break
             intersection_incoming_set.sort()
             combined_incoming_lane_ids.append(intersection_incoming_set)
             combined_incoming_lane_ids.sort()

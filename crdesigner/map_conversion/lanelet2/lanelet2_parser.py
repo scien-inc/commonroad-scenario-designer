@@ -147,6 +147,7 @@ class Lanelet2Parser:
             ):
                 traffic_lights = traffic_light.xpath("./member[@role='refers']/@ref")
                 ref_lines = traffic_light.xpath("./member[@role='ref_line']/@ref")
+                light_bulbs = traffic_light.xpath("./member[@role='light_bulbs']/@ref")
                 tag_dict = {
                     tag.get("k"): tag.get("v")
                     for tag in traffic_light.xpath("./tag[@k and @v]")
@@ -158,6 +159,7 @@ class Lanelet2Parser:
                         traffic_light.get("id"),
                         ref_line=ref_lines,
                         refers=traffic_lights,
+                        light_bulbs=light_bulbs,
                         tag_dict=tag_dict,
                     )
                 )

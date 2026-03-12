@@ -224,6 +224,7 @@ class RegulatoryElement:
         right_of_ways: Optional[list] = None,
         tag_dict: Optional[Dict[str, str]] = None,
         ref_line: Optional[list] = None,
+        light_bulbs: Optional[list] = None,
     ):
         """
         Initialization of RegulatoryElement
@@ -234,12 +235,14 @@ class RegulatoryElement:
         :param right_of_ways: list of the right of way IDs that the relation contains
         :param tag_dict: tag dictionary of the RegulatoryElement
         :param ref_line: list of the ref line IDs of the RegulatoryElement
+        :param light_bulbs: list of the light bulb way IDs of the RegulatoryElement
         """
         self.id_ = str(id_)
         self.refers = [str(i) for i in refers] if refers is not None else ()
         self.yield_ways = [str(i) for i in yield_ways] if yield_ways is not None else ()
         self.right_of_ways = [str(i) for i in right_of_ways] if right_of_ways is not None else ()
         self.ref_line = [str(i) for i in ref_line] if ref_line is not None else []
+        self.light_bulbs = [str(i) for i in light_bulbs] if light_bulbs is not None else []
         self.tag_dict = tag_dict if tag_dict is not None else {}
 
     def serialize_to_xml(self) -> etree.Element:
@@ -271,6 +274,11 @@ class RegulatoryElement:
             right_way.set("type", "way")
             right_way.set("ref", r)
             right_way.set("role", "ref_line")
+        for light_bulb in self.light_bulbs:
+            bulb_way = etree.SubElement(rel, "member")
+            bulb_way.set("type", "way")
+            bulb_way.set("ref", light_bulb)
+            bulb_way.set("role", "light_bulbs")
         for tag_key, tag_value in self.tag_dict.items():
             xml_node = etree.SubElement(rel, "tag")
             xml_node.set("k", tag_key)

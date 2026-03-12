@@ -9,6 +9,7 @@ from commonroad.scenario.lanelet import Lanelet, LaneletNetwork, LineMarking, St
 from commonroad.scenario.scenario import GeoTransformation, Location
 from commonroad.scenario.traffic_light import (
     TrafficLight,
+    TrafficLightCycle,
     TrafficLightCycleElement,
     TrafficLightDirection,
     TrafficLightState,
@@ -25,6 +26,8 @@ from pyproj import CRS, Transformer
 from crdesigner.common.config.general_config import general_config
 from crdesigner.common.config.gui_config import lanelet2_default
 from crdesigner.common.config.lanelet2_config import lanelet2_config
+from crdesigner.map_conversion.common.conversion_lanelet import ConversionLanelet
+from crdesigner.map_conversion.common.conversion_lanelet_network import ConversionLaneletNetwork
 from crdesigner.map_conversion.lanelet2.lanelet2 import (
     Multipolygon,
     Node,
@@ -36,6 +39,7 @@ from crdesigner.map_conversion.lanelet2.lanelet2 import (
 from crdesigner.map_conversion.lanelet2.lanelet2_parser import Lanelet2Parser
 from crdesigner.map_conversion.lanelet2.lanelet2cr import (
     Lanelet2CRConverter,
+    _TrafficLightRecord,
     _add_closest_traffic_sign_to_lanelet,
     _add_stop_line_to_lanelet,
     _two_vertices_coincide,
@@ -55,6 +59,34 @@ def contains(list, filter):
         if filter(x):
             return True
     return False
+
+
+def _make_conversion_lanelet(
+    lanelet_id: int,
+    left_vertices,
+    center_vertices,
+    right_vertices,
+    predecessor=None,
+    successor=None,
+    adjacent_left=None,
+    adjacent_left_same_direction=None,
+    adjacent_right=None,
+    adjacent_right_same_direction=None,
+):
+    return ConversionLanelet(
+        None,
+        np.array(left_vertices, dtype=float),
+        np.array(center_vertices, dtype=float),
+        np.array(right_vertices, dtype=float),
+        lanelet_id=lanelet_id,
+        predecessor=predecessor or [],
+        successor=successor or [],
+        adjacent_left=adjacent_left,
+        adjacent_left_same_direction=adjacent_left_same_direction,
+        adjacent_right=adjacent_right,
+        adjacent_right_same_direction=adjacent_right_same_direction,
+        lanelet_type="urban",
+    )
 
 
 # map of the generated id's for the lanelet CR format. Copied from the source code as
@@ -184,6 +216,281 @@ class TestLanelet2CRConverter(unittest.TestCase):
         parsed = Lanelet2Parser(xml).parse()
         way_relation = next(iter(parsed.way_relations.values()))
         self.assertEqual("right", way_relation.tag_dict["turn_direction"])
+
+    def test_parser_preserves_traffic_light_light_bulbs(self):
+        xml = etree.fromstring(
+            """
+            <osm version="0.6">
+              <node id="1" lat="49.0" lon="8.4" />
+              <node id="2" lat="49.0" lon="8.4001" />
+              <way id="11"><nd ref="1"/><nd ref="2"/></way>
+              <way id="12"><nd ref="1"/><nd ref="2"/></way>
+              <way id="13"><nd ref="1"/><nd ref="2"/></way>
+              <relation id="201">
+                <member type="way" role="refers" ref="11"/>
+                <member type="way" role="ref_line" ref="12"/>
+                <member type="way" role="light_bulbs" ref="13"/>
+                <tag k="type" v="regulatory_element"/>
+                <tag k="subtype" v="traffic_light"/>
+              </relation>
+            </osm>
+            """
+        )
+        parsed = Lanelet2Parser(xml).parse()
+        regulatory_element = next(iter(parsed.traffic_light_relations.values()))
+        self.assertEqual(["13"], regulatory_element.light_bulbs)
+
+    def test_signalized_intersection_merges_same_physical_head_without_direction_split(self):
+        l2cr = Lanelet2CRConverter()
+        l2cr.lanelet_network = ConversionLaneletNetwork()
+
+        lanelets = [
+            _make_conversion_lanelet(
+                1,
+                [[0.0, -10.0], [0.0, 0.0]],
+                [[0.5, -10.0], [0.5, 0.0]],
+                [[1.0, -10.0], [1.0, 0.0]],
+                successor=[3],
+                adjacent_right=2,
+                adjacent_right_same_direction=True,
+            ),
+            _make_conversion_lanelet(
+                2,
+                [[1.0, -10.0], [1.0, 0.0]],
+                [[1.5, -10.0], [1.5, 0.0]],
+                [[2.0, -10.0], [2.0, 0.0]],
+                successor=[4],
+                adjacent_left=1,
+                adjacent_left_same_direction=True,
+            ),
+            _make_conversion_lanelet(
+                3,
+                [[0.0, 0.0], [0.0, 10.0]],
+                [[0.5, 0.0], [0.5, 10.0]],
+                [[1.0, 0.0], [1.0, 10.0]],
+                predecessor=[1],
+            ),
+            _make_conversion_lanelet(
+                4,
+                [[1.0, 0.0], [11.0, 0.0]],
+                [[1.5, 0.5], [11.5, 0.5]],
+                [[2.0, 1.0], [12.0, 1.0]],
+                predecessor=[2],
+            ),
+            _make_conversion_lanelet(
+                5,
+                [[-10.0, 1.0], [0.0, 1.0]],
+                [[-10.0, 0.5], [0.0, 0.5]],
+                [[-10.0, 0.0], [0.0, 0.0]],
+                successor=[6],
+            ),
+            _make_conversion_lanelet(
+                6,
+                [[0.0, 1.0], [10.0, 1.0]],
+                [[0.0, 0.5], [10.0, 0.5]],
+                [[0.0, 0.0], [10.0, 0.0]],
+                predecessor=[5],
+            ),
+        ]
+
+        for lanelet in lanelets:
+            l2cr.lanelet_network.add_lanelet(lanelet)
+
+        cycle = TrafficLightCycle([TrafficLightCycleElement(TrafficLightState.GREEN, 5)], 1)
+        traffic_light_records = [
+            _TrafficLightRecord(
+                TrafficLight(
+                    100,
+                    np.array([0.5, 0.0]),
+                    cycle,
+                    active=True,
+                    direction=TrafficLightDirection.STRAIGHT,
+                ),
+                "tl-1",
+                candidate_lanelet_ids={1},
+                incoming_lanelet_ids={1},
+                controlled_successor_ids={3},
+                turn_directions={"straight"},
+                light_bulb_way_ids={"bulb-a", "bulb-b"},
+                ref_line_way_ids={"ref-1"},
+                source_relation_ids={"tl-1"},
+            ),
+            _TrafficLightRecord(
+                TrafficLight(
+                    101,
+                    np.array([1.5, 0.0]),
+                    cycle,
+                    active=True,
+                    direction=TrafficLightDirection.RIGHT,
+                ),
+                "tl-2",
+                candidate_lanelet_ids={2},
+                incoming_lanelet_ids={2},
+                controlled_successor_ids={4},
+                turn_directions={"right"},
+                light_bulb_way_ids={"bulb-a", "bulb-b"},
+                ref_line_way_ids={"ref-2"},
+                source_relation_ids={"tl-2"},
+            ),
+            _TrafficLightRecord(
+                TrafficLight(
+                    102,
+                    np.array([0.0, 0.5]),
+                    cycle,
+                    active=True,
+                    direction=TrafficLightDirection.STRAIGHT,
+                ),
+                "tl-3",
+                candidate_lanelet_ids={5},
+                incoming_lanelet_ids={5},
+                controlled_successor_ids={6},
+                turn_directions={"straight"},
+                light_bulb_way_ids={"bulb-c"},
+                source_relation_ids={"tl-3"},
+            ),
+        ]
+
+        l2cr._build_signalized_intersections(traffic_light_records)
+
+        self.assertEqual(1, len(l2cr.lanelet_network.intersections))
+        incoming_lanelet_sets = {
+            frozenset(incoming.incoming_lanelets)
+            for incoming in l2cr.lanelet_network.intersections[0].incomings
+        }
+        self.assertIn(frozenset({1, 2}), incoming_lanelet_sets)
+        self.assertIn(frozenset({5}), incoming_lanelet_sets)
+
+        merged_records = l2cr._merge_traffic_light_records_by_incoming_groups(traffic_light_records)
+        merged_record = next(
+            record for record in merged_records if record.incoming_lanelet_ids == {1, 2}
+        )
+        self.assertEqual({1, 2}, merged_record.candidate_lanelet_ids)
+        self.assertEqual({3, 4}, merged_record.controlled_successor_ids)
+        self.assertEqual({"bulb-a", "bulb-b"}, merged_record.light_bulb_way_ids)
+        self.assertEqual({"ref-1", "ref-2"}, merged_record.ref_line_way_ids)
+        self.assertEqual(TrafficLightDirection.ALL, merged_record.traffic_light.direction)
+
+    def test_signalized_intersection_keeps_distinct_physical_heads_separate(self):
+        l2cr = Lanelet2CRConverter()
+        l2cr.lanelet_network = ConversionLaneletNetwork()
+
+        lanelets = [
+            _make_conversion_lanelet(
+                1,
+                [[0.0, -10.0], [0.0, 0.0]],
+                [[0.5, -10.0], [0.5, 0.0]],
+                [[1.0, -10.0], [1.0, 0.0]],
+                successor=[3],
+                adjacent_right=2,
+                adjacent_right_same_direction=True,
+            ),
+            _make_conversion_lanelet(
+                2,
+                [[1.0, -10.0], [1.0, 0.0]],
+                [[1.5, -10.0], [1.5, 0.0]],
+                [[2.0, -10.0], [2.0, 0.0]],
+                successor=[4],
+                adjacent_left=1,
+                adjacent_left_same_direction=True,
+            ),
+            _make_conversion_lanelet(
+                3,
+                [[0.0, 0.0], [0.0, 10.0]],
+                [[0.5, 0.0], [0.5, 10.0]],
+                [[1.0, 0.0], [1.0, 10.0]],
+                predecessor=[1],
+            ),
+            _make_conversion_lanelet(
+                4,
+                [[1.0, 0.0], [11.0, 0.0]],
+                [[1.5, 0.5], [11.5, 0.5]],
+                [[2.0, 1.0], [12.0, 1.0]],
+                predecessor=[2],
+            ),
+            _make_conversion_lanelet(
+                5,
+                [[-10.0, 1.0], [0.0, 1.0]],
+                [[-10.0, 0.5], [0.0, 0.5]],
+                [[-10.0, 0.0], [0.0, 0.0]],
+                successor=[6],
+            ),
+            _make_conversion_lanelet(
+                6,
+                [[0.0, 1.0], [10.0, 1.0]],
+                [[0.0, 0.5], [10.0, 0.5]],
+                [[0.0, 0.0], [10.0, 0.0]],
+                predecessor=[5],
+            ),
+        ]
+
+        for lanelet in lanelets:
+            l2cr.lanelet_network.add_lanelet(lanelet)
+
+        cycle = TrafficLightCycle([TrafficLightCycleElement(TrafficLightState.GREEN, 5)], 1)
+        traffic_light_records = [
+            _TrafficLightRecord(
+                TrafficLight(
+                    100,
+                    np.array([0.5, 0.0]),
+                    cycle,
+                    active=True,
+                    direction=TrafficLightDirection.ALL,
+                ),
+                "tl-1",
+                candidate_lanelet_ids={1},
+                incoming_lanelet_ids={1},
+                controlled_successor_ids={3},
+                turn_directions={"straight"},
+                light_bulb_way_ids={"bulb-straight"},
+                source_relation_ids={"tl-1"},
+            ),
+            _TrafficLightRecord(
+                TrafficLight(
+                    101,
+                    np.array([1.5, 0.0]),
+                    cycle,
+                    active=True,
+                    direction=TrafficLightDirection.ALL,
+                ),
+                "tl-2",
+                candidate_lanelet_ids={2},
+                incoming_lanelet_ids={2},
+                controlled_successor_ids={4},
+                turn_directions={"right"},
+                light_bulb_way_ids={"bulb-right"},
+                source_relation_ids={"tl-2"},
+            ),
+            _TrafficLightRecord(
+                TrafficLight(
+                    102,
+                    np.array([0.0, 0.5]),
+                    cycle,
+                    active=True,
+                    direction=TrafficLightDirection.ALL,
+                ),
+                "tl-3",
+                candidate_lanelet_ids={5},
+                incoming_lanelet_ids={5},
+                controlled_successor_ids={6},
+                turn_directions={"straight"},
+                light_bulb_way_ids={"bulb-cross"},
+                source_relation_ids={"tl-3"},
+            ),
+        ]
+
+        l2cr._build_signalized_intersections(traffic_light_records)
+        merged_records = l2cr._merge_traffic_light_records_by_incoming_groups(traffic_light_records)
+
+        incoming_records = [
+            record for record in merged_records if record.incoming_lanelet_ids == {1, 2}
+        ]
+        self.assertEqual(2, len(incoming_records))
+        direction_by_bulb = {
+            frozenset(record.light_bulb_way_ids): record.traffic_light.direction
+            for record in incoming_records
+        }
+        self.assertEqual(TrafficLightDirection.ALL, direction_by_bulb[frozenset({"bulb-straight"})])
+        self.assertEqual(TrafficLightDirection.ALL, direction_by_bulb[frozenset({"bulb-right"})])
 
     def test_add_closest_traffic_sign_to_lanelet(self):
         # testing the function by creating a list of lanelets and a list of signs and checking the result

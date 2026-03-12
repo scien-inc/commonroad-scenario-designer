@@ -309,6 +309,10 @@ class _TrafficLightRecord:
     incoming_lanelet_ids: Set[int] = field(default_factory=set)
     controlled_successor_ids: Set[int] = field(default_factory=set)
     turn_directions: Set[str] = field(default_factory=set)
+    light_bulb_way_ids: Set[str] = field(default_factory=set)
+    ref_line_way_ids: Set[str] = field(default_factory=set)
+    source_relation_ids: Set[str] = field(default_factory=set)
+    incoming_group_key: Tuple[int, ...] = field(default_factory=tuple)
 
 
 class Lanelet2CRConverter:
@@ -533,6 +537,9 @@ class Lanelet2CRConverter:
 
         traffic_light_records = self._collect_traffic_light_records(new_ids)
         self._build_signalized_intersections(traffic_light_records)
+        traffic_light_records = self._merge_traffic_light_records_by_incoming_groups(
+            traffic_light_records
+        )
         traffic_lights = self._build_commonroad_traffic_lights(traffic_light_records)
         if traffic_lights:
             self.lanelet_network.add_traffic_lights_to_network(traffic_lights)
@@ -554,7 +561,7 @@ class Lanelet2CRConverter:
         self,
         traffic_light_way: Way,
         new_lanelet_ids: Dict[str, int],
-        direction: TrafficLightDirection = TrafficLightDirection.ALL,
+        direction: Optional[TrafficLightDirection] = TrafficLightDirection.ALL,
     ) -> TrafficLight:
         """
         Converting a traffic light, which is formatted as Way in Lanelet2 format, to
@@ -625,22 +632,22 @@ class Lanelet2CRConverter:
             controlled_successor_ids = self._find_controlled_successors(
                 incoming_lanelet_ids, candidate_lanelet_ids
             )
-            direction = self._derive_direction_from_turn_tags(turn_directions)
-            if direction is None:
-                direction = self._derive_direction_from_geometry(
-                    next(iter(sorted(incoming_lanelet_ids)), None), controlled_successor_ids
-                )
 
             records.append(
                 _TrafficLightRecord(
                     traffic_light=self.traffic_light_conversion(
-                        traffic_light_way, new_lanelet_ids, direction=direction
+                        traffic_light_way,
+                        new_lanelet_ids,
+                        direction=TrafficLightDirection.ALL,
                     ),
                     regulatory_element_id=tl_relation.id_,
                     candidate_lanelet_ids=candidate_lanelet_ids,
                     incoming_lanelet_ids=incoming_lanelet_ids,
                     controlled_successor_ids=controlled_successor_ids,
                     turn_directions=turn_directions,
+                    light_bulb_way_ids=set(getattr(tl_relation, "light_bulbs", [])),
+                    ref_line_way_ids=set(tl_relation.ref_line),
+                    source_relation_ids={tl_relation.id_},
                 )
             )
 
@@ -651,6 +658,7 @@ class Lanelet2CRConverter:
                 _TrafficLightRecord(
                     traffic_light=self.traffic_light_conversion(way, new_lanelet_ids),
                     regulatory_element_id=way.id_,
+                    source_relation_ids={way.id_},
                 )
             )
 
@@ -849,13 +857,55 @@ class Lanelet2CRConverter:
                 components.append(component)
 
         for component in components:
-            intersection_map = {
-                incoming_lanelet_id: sorted(incoming_to_successors[incoming_lanelet_id])
-                for incoming_lanelet_id in component
-                if incoming_to_successors[incoming_lanelet_id]
-            }
+            intersection_map = {}
+            for lanelet_group in self._group_same_direction_component_lanelets(component):
+                group_successors = set()
+                for incoming_lanelet_id in lanelet_group:
+                    group_successors.update(incoming_to_successors[incoming_lanelet_id])
+
+                if not group_successors:
+                    continue
+
+                sorted_successors = sorted(group_successors)
+                for incoming_lanelet_id in lanelet_group:
+                    intersection_map[incoming_lanelet_id] = sorted_successors
+
             if len(intersection_map) >= 2:
                 self.lanelet_network.create_intersection(intersection_map, set(intersection_map.keys()))
+
+    def _group_same_direction_component_lanelets(self, lanelet_ids: Set[int]) -> List[Set[int]]:
+        remaining_lanelet_ids = set(lanelet_ids)
+        groups = []
+
+        while remaining_lanelet_ids:
+            start_lanelet_id = remaining_lanelet_ids.pop()
+            group = {start_lanelet_id}
+            pending = [start_lanelet_id]
+
+            while pending:
+                lanelet_id = pending.pop()
+                lanelet = self.lanelet_network.find_lanelet_by_id(lanelet_id)
+                if lanelet is None:
+                    continue
+
+                adjacent_candidates = [
+                    (lanelet.adj_left, lanelet.adj_left_same_direction),
+                    (lanelet.adj_right, lanelet.adj_right_same_direction),
+                ]
+                for adjacent_lanelet_id, same_direction in adjacent_candidates:
+                    if (
+                        adjacent_lanelet_id is None
+                        or not same_direction
+                        or adjacent_lanelet_id not in remaining_lanelet_ids
+                    ):
+                        continue
+                    remaining_lanelet_ids.remove(adjacent_lanelet_id)
+                    group.add(adjacent_lanelet_id)
+                    pending.append(adjacent_lanelet_id)
+
+            groups.append(group)
+
+        return groups
 
     def _incoming_successors_intersect(
         self,
@@ -904,6 +954,161 @@ class Lanelet2CRConverter:
 
         return controlled_successors
 
+    def _merge_traffic_light_records_by_incoming_groups(
+        self, traffic_light_records: List[_TrafficLightRecord]
+    ) -> List[_TrafficLightRecord]:
+        incoming_groups = self._get_intersection_incoming_groups()
+        merged_records: List[_TrafficLightRecord] = []
+        records_by_incoming_group: Dict[Tuple[int, ...], List[_TrafficLightRecord]] = defaultdict(list)
+
+        for record in traffic_light_records:
+            incoming_lanelet_ids = set(record.incoming_lanelet_ids)
+            if not incoming_lanelet_ids:
+                merged_records.append(record)
+                continue
+
+            merged_incoming_lanelet_ids = set()
+            for incoming_lanelet_id in incoming_lanelet_ids:
+                merged_incoming_lanelet_ids.update(
+                    incoming_groups.get(incoming_lanelet_id, {incoming_lanelet_id})
+                )
+
+            if not merged_incoming_lanelet_ids:
+                merged_records.append(record)
+                continue
+
+            key = tuple(sorted(merged_incoming_lanelet_ids))
+            record.incoming_lanelet_ids = set(merged_incoming_lanelet_ids)
+            record.incoming_group_key = key
+            if not record.candidate_lanelet_ids:
+                record.candidate_lanelet_ids = set(merged_incoming_lanelet_ids)
+            records_by_incoming_group[key].append(record)
+
+        for incoming_group_records in records_by_incoming_group.values():
+            physical_head_records = self._merge_records_by_physical_head(incoming_group_records)
+            for grouped_record in physical_head_records:
+                if not grouped_record.controlled_successor_ids:
+                    grouped_record.controlled_successor_ids = self._collect_successors_for_lanelets(
+                        grouped_record.incoming_lanelet_ids
+                    )
+                grouped_record.traffic_light.direction = TrafficLightDirection.ALL
+                merged_records.append(grouped_record)
+
+        return merged_records
+
+    def _merge_records_by_physical_head(
+        self, incoming_group_records: List[_TrafficLightRecord]
+    ) -> List[_TrafficLightRecord]:
+        grouped_records: List[_TrafficLightRecord] = []
+        generic_record: Optional[_TrafficLightRecord] = None
+
+        for record in incoming_group_records:
+            if not record.light_bulb_way_ids:
+                if generic_record is None:
+                    generic_record = record
+                    grouped_records.append(generic_record)
+                else:
+                    self._merge_traffic_light_record_into(generic_record, record)
+                continue
+
+            matching_indices = [
+                index
+                for index, grouped_record in enumerate(grouped_records)
+                if grouped_record.light_bulb_way_ids
+                and grouped_record.light_bulb_way_ids.intersection(record.light_bulb_way_ids)
+            ]
+
+            if not matching_indices:
+                grouped_records.append(record)
+                continue
+
+            primary_group = grouped_records[matching_indices[0]]
+            self._merge_traffic_light_record_into(primary_group, record)
+
+            for index in reversed(matching_indices[1:]):
+                self._merge_traffic_light_record_into(primary_group, grouped_records[index])
+                del grouped_records[index]
+
+        return grouped_records
+
+    def _merge_traffic_light_record_into(
+        self, target_record: _TrafficLightRecord, source_record: _TrafficLightRecord
+    ) -> None:
+        target_record.candidate_lanelet_ids.update(source_record.candidate_lanelet_ids)
+        target_record.incoming_lanelet_ids.update(source_record.incoming_lanelet_ids)
+        target_record.controlled_successor_ids.update(source_record.controlled_successor_ids)
+        target_record.turn_directions.update(source_record.turn_directions)
+        target_record.light_bulb_way_ids.update(source_record.light_bulb_way_ids)
+        target_record.ref_line_way_ids.update(source_record.ref_line_way_ids)
+        target_record.source_relation_ids.update(source_record.source_relation_ids)
+        if source_record.regulatory_element_id:
+            target_record.source_relation_ids.add(source_record.regulatory_element_id)
+        if target_record.source_relation_ids:
+            target_record.regulatory_element_id = ",".join(sorted(target_record.source_relation_ids))
+        if source_record.incoming_group_key and not target_record.incoming_group_key:
+            target_record.incoming_group_key = source_record.incoming_group_key
+
+    def _derive_direction_for_merged_record(
+        self,
+        record: _TrafficLightRecord,
+        sibling_records: List[_TrafficLightRecord],
+    ) -> TrafficLightDirection:
+        if not record.light_bulb_way_ids:
+            return TrafficLightDirection.ALL
+
+        distinct_physical_heads = {
+            tuple(sorted(sibling_record.light_bulb_way_ids))
+            for sibling_record in sibling_records
+            if sibling_record.light_bulb_way_ids
+        }
+        if len(distinct_physical_heads) < 2:
+            return TrafficLightDirection.ALL
+
+        current_successors = set(record.controlled_successor_ids)
+        if not current_successors:
+            return TrafficLightDirection.ALL
+
+        if not any(
+            sibling_record is not record
+            and sibling_record.light_bulb_way_ids
+            and sibling_record.controlled_successor_ids
+            and current_successors != sibling_record.controlled_successor_ids
+            and current_successors.isdisjoint(sibling_record.controlled_successor_ids)
+            for sibling_record in sibling_records
+        ):
+            return TrafficLightDirection.ALL
+
+        direction = self._derive_direction_from_turn_tags(record.turn_directions)
+        if direction is None:
+            direction = self._derive_direction_from_incoming_lanelets(
+                record.incoming_lanelet_ids,
+                current_successors,
+            )
+
+        if direction == TrafficLightDirection.ALL:
+            return TrafficLightDirection.ALL
+
+        return direction or TrafficLightDirection.ALL
+
+    def _get_intersection_incoming_groups(self) -> Dict[int, Set[int]]:
+        incoming_groups: Dict[int, Set[int]] = {}
+        for intersection in self.lanelet_network.intersections:
+            for incoming in intersection.incomings:
+                incoming_lanelets = set(incoming.incoming_lanelets)
+                for incoming_lanelet_id in incoming_lanelets:
+                    incoming_groups[incoming_lanelet_id] = incoming_lanelets
+
+        return incoming_groups
+
+    def _collect_successors_for_lanelets(self, lanelet_ids: Set[int]) -> Set[int]:
+        successor_ids = set()
+        for lanelet_id in lanelet_ids:
+            lanelet = self.lanelet_network.find_lanelet_by_id(lanelet_id)
+            if lanelet is not None:
+                successor_ids.update(lanelet.successor)
+
+        return successor_ids
+
     def _derive_direction_from_turn_tags(
         self, turn_directions: Set[str]
     ) -> Optional[TrafficLightDirection]:
@@ -933,17 +1138,29 @@ class Lanelet2CRConverter:
         if incoming_lanelet_id is None:
             return TrafficLightDirection.ALL
 
-        incoming_lanelet = self.lanelet_network.find_lanelet_by_id(incoming_lanelet_id)
-        if incoming_lanelet is None:
-            return TrafficLightDirection.ALL
+        return self._derive_direction_from_incoming_lanelets(
+            {incoming_lanelet_id}, controlled_successor_ids
+        )
 
-        successor_directions = self.lanelet_network.get_successor_directions(incoming_lanelet)
-        relevant_successors = controlled_successor_ids or set(successor_directions.keys())
-        direction_names = {
-            successor_directions[successor_id]
-            for successor_id in relevant_successors
-            if successor_id in successor_directions
-        }
+    def _derive_direction_from_incoming_lanelets(
+        self,
+        incoming_lanelet_ids: Set[int],
+        controlled_successor_ids: Set[int],
+    ) -> TrafficLightDirection:
+        direction_names = set()
+        for incoming_lanelet_id in incoming_lanelet_ids:
+            incoming_lanelet = self.lanelet_network.find_lanelet_by_id(incoming_lanelet_id)
+            if incoming_lanelet is None:
+                continue
+
+            successor_directions = self.lanelet_network.get_successor_directions(incoming_lanelet)
+            relevant_successors = controlled_successor_ids or set(successor_directions.keys())
+            direction_names.update(
+                successor_directions[successor_id]
+                for successor_id in relevant_successors
+                if successor_id in successor_directions
+            )
+
         return self._direction_names_to_enum(direction_names) or TrafficLightDirection.ALL
 
     def _direction_names_to_enum(
@@ -971,7 +1188,7 @@ class Lanelet2CRConverter:
 
         for record in traffic_light_records:
             if record.incoming_lanelet_ids & mapped_incoming_lanelet_ids:
-                for lanelet_id in record.candidate_lanelet_ids:
+                for lanelet_id in record.incoming_lanelet_ids:
                     lanelet = self.lanelet_network.find_lanelet_by_id(lanelet_id)
                     if lanelet is not None:
                         lanelet.add_traffic_light_to_lanelet(record.traffic_light.traffic_light_id)
