@@ -4,6 +4,8 @@ from collections import defaultdict
 import inspect
 import logging
 import os
+from pathlib import Path
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -833,6 +835,387 @@ def _build_japanese_default_tls_program(
         connection.tl_link = index
 
     return tls_program, ordered_connections
+
+
+def _parse_sumo_shape(shape_attr: str | None) -> np.ndarray:
+    if not shape_attr:
+        return np.empty((0, 2), dtype=float)
+
+    points = []
+    for token in shape_attr.split():
+        coordinates = token.split(",")
+        if len(coordinates) < 2:
+            continue
+        try:
+            points.append([float(coordinates[0]), float(coordinates[1])])
+        except ValueError:
+            continue
+    return np.asarray(points, dtype=float)
+
+
+def _edge_lane_shapes_from_net(root: ET.Element) -> dict[str, dict[int, np.ndarray]]:
+    edge_lane_shapes: dict[str, dict[int, np.ndarray]] = {}
+    for edge_element in root.findall("edge"):
+        edge_id = edge_element.get("id")
+        if not edge_id:
+            continue
+
+        lane_shapes: dict[int, np.ndarray] = {}
+        for lane_element in edge_element.findall("lane"):
+            lane_index_raw = lane_element.get("index")
+            lane_id = lane_element.get("id", "")
+            try:
+                lane_index = int(lane_index_raw) if lane_index_raw is not None else int(lane_id.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+
+            lane_shape = _parse_sumo_shape(lane_element.get("shape"))
+            if len(lane_shape) >= 2:
+                lane_shapes[lane_index] = lane_shape
+
+        if lane_shapes:
+            edge_lane_shapes[edge_id] = lane_shapes
+
+    return edge_lane_shapes
+
+
+def _net_connection_sort_key(connection_info: dict) -> tuple:
+    return (
+        int(connection_info["link_index"]),
+        str(connection_info["from_edge_id"]),
+        int(connection_info["from_lane"]),
+        str(connection_info["to_edge_id"]),
+        int(connection_info["to_lane"]),
+    )
+
+
+def _build_net_approach_infos(connections: list[dict], edge_lane_shapes: dict[str, dict[int, np.ndarray]]):
+    approach_infos: dict[str, dict] = {}
+    for connection in connections:
+        from_edge_id = connection["from_edge_id"]
+        from_lane = connection["from_lane"]
+        lane_shape = edge_lane_shapes.get(from_edge_id, {}).get(from_lane)
+        if lane_shape is None:
+            lane_shapes = edge_lane_shapes.get(from_edge_id, {})
+            lane_shape = next(iter(lane_shapes.values()), np.empty((0, 2), dtype=float))
+
+        if len(lane_shape) >= 2:
+            end_point = lane_shape[-1]
+            start_index = -3 if len(lane_shape) >= 3 else -2
+            start_point = lane_shape[start_index]
+            direction = end_point - start_point
+        else:
+            end_point = np.zeros(2, dtype=float)
+            direction = np.array([1.0, 0.0], dtype=float)
+
+        if np.linalg.norm(direction) == 0:
+            direction = np.array([1.0, 0.0], dtype=float)
+
+        approach_info = approach_infos.setdefault(
+            from_edge_id,
+            {
+                "from_edge_id": from_edge_id,
+                "connections": [],
+                "directions": [],
+                "end_points": [],
+            },
+        )
+        approach_info["connections"].append(connection)
+        approach_info["directions"].append(direction / np.linalg.norm(direction))
+        approach_info["end_points"].append(end_point)
+
+    for approach_info in approach_infos.values():
+        direction = np.mean(np.asarray(approach_info["directions"]), axis=0)
+        if np.linalg.norm(direction) == 0:
+            direction = np.array([1.0, 0.0], dtype=float)
+        direction = direction / np.linalg.norm(direction)
+        end_point = np.mean(np.asarray(approach_info["end_points"]), axis=0)
+        approach_info["direction"] = direction
+        approach_info["angle"] = float(np.degrees(np.arctan2(direction[1], direction[0])))
+        approach_info["end_point"] = end_point
+
+    return approach_infos
+
+
+def _cluster_net_approaches(approach_infos: dict[str, dict]) -> list[dict]:
+    remaining_edge_ids = set(approach_infos.keys())
+    clusters: list[dict] = []
+
+    while remaining_edge_ids:
+        start_edge_id = remaining_edge_ids.pop()
+        cluster_edge_ids = {start_edge_id}
+        pending = [start_edge_id]
+
+        while pending:
+            current_edge_id = pending.pop()
+            current_info = approach_infos[current_edge_id]
+            current_angle = current_info["angle"]
+            current_end = current_info["end_point"]
+
+            for other_edge_id in list(remaining_edge_ids):
+                other_info = approach_infos[other_edge_id]
+                if (
+                    _circular_angle_difference_degrees(current_angle, other_info["angle"]) <= 20.0
+                    and float(np.linalg.norm(current_end - other_info["end_point"])) <= 20.0
+                ):
+                    remaining_edge_ids.remove(other_edge_id)
+                    cluster_edge_ids.add(other_edge_id)
+                    pending.append(other_edge_id)
+
+        cluster_connections = []
+        cluster_directions = []
+        cluster_end_points = []
+        for edge_id in sorted(cluster_edge_ids):
+            cluster_connections.extend(approach_infos[edge_id]["connections"])
+            cluster_directions.append(approach_infos[edge_id]["direction"])
+            cluster_end_points.append(approach_infos[edge_id]["end_point"])
+
+        cluster_direction = np.mean(np.asarray(cluster_directions), axis=0)
+        if np.linalg.norm(cluster_direction) == 0:
+            cluster_direction = np.array([1.0, 0.0], dtype=float)
+        cluster_direction = cluster_direction / np.linalg.norm(cluster_direction)
+        clusters.append(
+            {
+                "edge_ids": cluster_edge_ids,
+                "connections": cluster_connections,
+                "direction": cluster_direction,
+                "angle": float(np.degrees(np.arctan2(cluster_direction[1], cluster_direction[0]))),
+                "end_point": np.mean(np.asarray(cluster_end_points), axis=0),
+            }
+        )
+
+    clusters.sort(key=lambda cluster: cluster["angle"])
+    return clusters
+
+
+def _build_japanese_default_phase_groups_for_net(clusters: list[dict]) -> list[list[int]]:
+    if not clusters:
+        return []
+
+    unused_indices = set(range(len(clusters)))
+    phase_groups: list[list[int]] = []
+
+    while unused_indices:
+        base_index = min(unused_indices, key=lambda index: clusters[index]["angle"])
+        unused_indices.remove(base_index)
+
+        opposite_index = None
+        opposite_score = None
+        for candidate_index in sorted(unused_indices):
+            score = abs(
+                180.0
+                - _circular_angle_difference_degrees(
+                    clusters[base_index]["angle"], clusters[candidate_index]["angle"]
+                )
+            )
+            if score > 45.0:
+                continue
+            if opposite_score is None or score < opposite_score:
+                opposite_index = candidate_index
+                opposite_score = score
+
+        phase_group = [base_index]
+        if opposite_index is not None:
+            unused_indices.remove(opposite_index)
+            phase_group.append(opposite_index)
+
+        phase_groups.append(phase_group)
+
+    phase_groups.sort(key=lambda group: min(clusters[index]["angle"] for index in group))
+    return phase_groups
+
+
+def _connection_conflict_on_net(first_connection: dict, second_connection: dict) -> tuple[bool, bool]:
+    first_shape = first_connection["shape"]
+    second_shape = second_connection["shape"]
+    if len(first_shape) < 2 or len(second_shape) < 2:
+        return False, False
+
+    try:
+        from shapely.geometry import LineString
+
+        intersects = LineString(first_shape).intersects(LineString(second_shape))
+    except Exception:
+        return False, False
+
+    if not intersects:
+        return False, False
+
+    direction_dot = np.dot(first_shape[-1] - first_shape[0], second_shape[-1] - second_shape[0])
+    if direction_dot >= 0:
+        return False, False
+
+    first_curvature = _polyline_curvature(first_shape)
+    second_curvature = _polyline_curvature(second_shape)
+    return True, first_curvature <= second_curvature
+
+
+def _polyline_curvature(polyline: np.ndarray) -> float:
+    if not isinstance(polyline, np.ndarray) or polyline.ndim != 2 or len(polyline) < 2:
+        return 0.0
+
+    x_d = np.gradient(polyline[:, 0])
+    x_dd = np.gradient(x_d)
+    y_d = np.gradient(polyline[:, 1])
+    y_dd = np.gradient(y_d)
+    denominator = (x_d**2 + y_d**2) ** (3.0 / 2.0)
+    denominator[denominator == 0] = 1.0
+    curvature = (x_d * y_dd - x_dd * y_d) / denominator
+    return float(np.max(np.abs(curvature)))
+
+
+def _build_green_state_for_net(ordered_connections: list[dict], active_indices: list[int]) -> str:
+    state = ["r"] * len(ordered_connections)
+    for active_index in active_indices:
+        state[active_index] = "g"
+
+    for left_pos, left_index in enumerate(active_indices):
+        for right_index in active_indices[left_pos + 1 :]:
+            conflicts, left_has_priority = _connection_conflict_on_net(
+                ordered_connections[left_index],
+                ordered_connections[right_index],
+            )
+            if not conflicts:
+                continue
+            if left_has_priority:
+                state[left_index] = "G"
+                state[right_index] = "g"
+            else:
+                state[left_index] = "g"
+                state[right_index] = "G"
+
+    return "".join(state)
+
+
+def _uniform_state_for_net(length: int, active_indices: list[int], active_char: str) -> str:
+    state = ["r"] * length
+    for active_index in active_indices:
+        state[active_index] = active_char
+    return "".join(state)
+
+
+def rewrite_net_xml_with_japanese_default_tls(net_file: str | Path) -> int:
+    net_path = Path(net_file)
+    if not net_path.exists():
+        return 0
+
+    tree = ET.parse(net_path)
+    root = tree.getroot()
+    edge_lane_shapes = _edge_lane_shapes_from_net(root)
+
+    tl_connections: dict[str, list[dict]] = defaultdict(list)
+    for connection_element in root.findall("connection"):
+        tl_id = connection_element.get("tl")
+        link_index_raw = connection_element.get("linkIndex")
+        from_edge_id = connection_element.get("from")
+        from_lane_raw = connection_element.get("fromLane")
+        to_edge_id = connection_element.get("to")
+        to_lane_raw = connection_element.get("toLane")
+        if (
+            not tl_id
+            or link_index_raw is None
+            or from_edge_id is None
+            or from_lane_raw is None
+            or to_edge_id is None
+            or to_lane_raw is None
+        ):
+            continue
+
+        try:
+            link_index = int(link_index_raw)
+            from_lane = int(from_lane_raw)
+            to_lane = int(to_lane_raw)
+        except ValueError:
+            continue
+
+        tl_connections[tl_id].append(
+            {
+                "element": connection_element,
+                "tl_id": tl_id,
+                "link_index": link_index,
+                "from_edge_id": from_edge_id,
+                "from_lane": from_lane,
+                "to_edge_id": to_edge_id,
+                "to_lane": to_lane,
+                "shape": _parse_sumo_shape(connection_element.get("shape")),
+            }
+        )
+
+    rewritten_tls = 0
+    for tl_element in root.findall("tlLogic"):
+        tl_id = tl_element.get("id")
+        if not tl_id or tl_id not in tl_connections:
+            continue
+
+        ordered_connections = sorted(tl_connections[tl_id], key=_net_connection_sort_key)
+        approach_infos = _build_net_approach_infos(ordered_connections, edge_lane_shapes)
+        clusters = _cluster_net_approaches(approach_infos)
+        if len(clusters) < 2:
+            continue
+
+        phase_groups = _build_japanese_default_phase_groups_for_net(clusters)
+        if not phase_groups:
+            continue
+
+        link_index_to_position = {
+            connection["link_index"]: position
+            for position, connection in enumerate(ordered_connections)
+        }
+        max_link_index = max(connection["link_index"] for connection in ordered_connections)
+        state_length = max_link_index + 1
+        rewritten_phases = []
+
+        for phase_group in phase_groups:
+            active_link_indices = sorted(
+                {
+                    connection["link_index"]
+                    for cluster_index in phase_group
+                    for connection in clusters[cluster_index]["connections"]
+                }
+            )
+            if not active_link_indices:
+                continue
+
+            active_positions = sorted(
+                link_index_to_position[link_index] for link_index in active_link_indices
+            )
+            compact_green = _build_green_state_for_net(ordered_connections, active_positions)
+            compact_yellow = _uniform_state_for_net(
+                len(ordered_connections), active_positions, "y"
+            )
+            expanded_green = ["r"] * state_length
+            expanded_yellow = ["r"] * state_length
+            for connection, state_char in zip(ordered_connections, compact_green):
+                expanded_green[connection["link_index"]] = state_char
+            for connection, state_char in zip(ordered_connections, compact_yellow):
+                expanded_yellow[connection["link_index"]] = state_char
+
+            rewritten_phases.append((str(int(_JP_DEFAULT_GREEN_DURATION)), "".join(expanded_green)))
+            rewritten_phases.append((str(int(_JP_DEFAULT_YELLOW_DURATION)), "".join(expanded_yellow)))
+            rewritten_phases.append((str(int(_JP_DEFAULT_ALL_RED_DURATION)), "r" * state_length))
+
+        if not rewritten_phases:
+            continue
+
+        for phase_element in list(tl_element.findall("phase")):
+            tl_element.remove(phase_element)
+
+        tl_element.set("programID", f"jp_default_{tl_id}")
+        tl_element.set("type", "static")
+        tl_element.set("offset", tl_element.get("offset", "0"))
+        for duration, state in rewritten_phases:
+            ET.SubElement(tl_element, "phase", duration=duration, state=state)
+
+        first_state = rewritten_phases[0][1]
+        for connection in ordered_connections:
+            connection["element"].set("state", first_state[connection["link_index"]])
+
+        rewritten_tls += 1
+
+    if rewritten_tls:
+        tree.write(net_path, encoding="utf-8", xml_declaration=True)
+
+    return rewritten_tls
 
 
 def apply_commonroad_sumo_traffic_light_patch() -> bool:

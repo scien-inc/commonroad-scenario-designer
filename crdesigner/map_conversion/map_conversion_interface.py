@@ -33,6 +33,7 @@ from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
     apply_commonroad_sumo_netconvert_tls_patch,
     apply_commonroad_sumo_nd_patch,
     apply_commonroad_sumo_traffic_light_patch,
+    rewrite_net_xml_with_japanese_default_tls,
 )
 from crdesigner.map_conversion.sumo_map.sumo2cr import convert_net_to_cr
 
@@ -129,6 +130,27 @@ def _create_2d_scenario_for_sumo(input_file: Path_T) -> Scenario:
     return scenario
 
 
+def _latest_net_file_in_output_dir(output_dir: Path) -> Optional[Path]:
+    candidates = sorted(output_dir.glob("*.net.xml"), key=lambda path: path.stat().st_mtime)
+    return candidates[-1] if candidates else None
+
+
+def _postprocess_japanese_sumo_tls(scenario: Scenario, output_dir: Path) -> None:
+    if getattr(getattr(scenario, "scenario_id", None), "country_id", None) != "JPN":
+        return
+
+    net_file = _latest_net_file_in_output_dir(output_dir)
+    if net_file is None:
+        logging.warning("JPN TLS postprocess skipped because no SUMO net.xml was found in %s.", output_dir)
+        return
+
+    rewritten_tls = rewrite_net_xml_with_japanese_default_tls(net_file)
+    logging.info(
+        "Rewrote %d tlLogic programs in final SUMO net.xml using Japanese default phase grouping.",
+        rewritten_tls,
+    )
+
+
 def commonroad_to_sumo(
     input_file: Path_T,
     output_file: Path_T,
@@ -159,6 +181,7 @@ def commonroad_to_sumo(
         scenario_2d = _create_2d_scenario_for_sumo(input_file)
         converter = CR2SumoMapConverter(scenario_2d)
         converter.create_sumo_files(output_dir)
+        _postprocess_japanese_sumo_tls(converter._scenario, output_dir)
         logging.info("CR->SUMO conversion finished in forced 2D mode.")
         return
 
@@ -170,6 +193,7 @@ def commonroad_to_sumo(
     try:
         converter = CR2SumoMapConverter.from_file(input_file)
         converter.create_sumo_files(output_dir)
+        _postprocess_japanese_sumo_tls(converter._scenario, output_dir)
         logging.info("CR->SUMO conversion finished with z preservation enabled.")
     except Exception as err:
         if not fallback_2d:
@@ -184,6 +208,7 @@ def commonroad_to_sumo(
         scenario_2d = _create_2d_scenario_for_sumo(input_file)
         converter = CR2SumoMapConverter(scenario_2d)
         converter.create_sumo_files(output_dir)
+        _postprocess_japanese_sumo_tls(converter._scenario, output_dir)
         logging.info("CR->SUMO conversion succeeded after 2D fallback retry.")
 
 

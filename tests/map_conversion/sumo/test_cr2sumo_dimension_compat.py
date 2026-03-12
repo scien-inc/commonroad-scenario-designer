@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from crdesigner.map_conversion.sumo_map.cr2sumo_dimension_compat import (
     apply_commonroad_sumo_netconvert_tls_patch,
     apply_commonroad_sumo_nd_patch,
     apply_commonroad_sumo_traffic_light_patch,
+    rewrite_net_xml_with_japanese_default_tls,
 )
 
 
@@ -690,6 +692,149 @@ class TestCR2SumoDimensionCompat(unittest.TestCase):
                     compat._NETCONVERT_TLS_PATCH_FLAG,
                     original_flag,
                 )
+
+    def test_rewrite_net_xml_with_japanese_default_tls_groups_same_from_edge(self):
+        net_xml = """<?xml version='1.0' encoding='UTF-8'?>
+<net>
+  <tlLogic id="100" type="static" programID="0" offset="0">
+    <phase duration="23" state="rGr"/>
+    <phase duration="7" state="ryr"/>
+  </tlLogic>
+  <edge id="south" from="n1" to="j1">
+    <lane id="south_0" index="0" speed="13.9" length="10" shape="0,-10 0,0"/>
+    <lane id="south_1" index="1" speed="13.9" length="10" shape="1,-10 1,0"/>
+  </edge>
+  <edge id="north" from="n2" to="j1">
+    <lane id="north_0" index="0" speed="13.9" length="10" shape="0,10 0,0"/>
+  </edge>
+  <edge id="out_s" from="j1" to="n3">
+    <lane id="out_s_0" index="0" speed="13.9" length="10" shape="0,0 0,10"/>
+  </edge>
+  <edge id="out_r" from="j1" to="n4">
+    <lane id="out_r_0" index="0" speed="13.9" length="10" shape="0,0 10,0"/>
+  </edge>
+  <edge id="out_n" from="j1" to="n5">
+    <lane id="out_n_0" index="0" speed="13.9" length="10" shape="0,0 0,-10"/>
+  </edge>
+  <connection from="south" to="out_r" fromLane="0" toLane="0" tl="100" linkIndex="0" dir="r" state="r" shape="0,-1 0,0 1,0"/>
+  <connection from="south" to="out_s" fromLane="1" toLane="0" tl="100" linkIndex="1" dir="s" state="G" shape="1,-1 1,1"/>
+  <connection from="north" to="out_n" fromLane="0" toLane="0" tl="100" linkIndex="2" dir="s" state="r" shape="0,1 0,-1"/>
+</net>
+"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            net_path = f"{tmp_dir}/test.net.xml"
+            with open(net_path, "w", encoding="utf-8") as fh:
+                fh.write(net_xml)
+
+            rewritten = rewrite_net_xml_with_japanese_default_tls(net_path)
+            self.assertEqual(1, rewritten)
+
+            tree = importlib.import_module("xml.etree.ElementTree").parse(net_path)
+            root = tree.getroot()
+            tl_logic = root.find(".//tlLogic[@id='100']")
+            self.assertEqual("jp_default_100", tl_logic.attrib["programID"])
+            phases = tl_logic.findall("phase")
+            self.assertEqual(3, len(phases))
+            first_state = phases[0].attrib["state"]
+            self.assertEqual(first_state[0], first_state[1])
+            self.assertIn(first_state[0], {"g", "G"})
+            self.assertIn(first_state[2], {"g", "G"})
+
+    def test_rewrite_net_xml_with_japanese_default_tls_creates_valid_state_length(self):
+        net_xml = """<?xml version='1.0' encoding='UTF-8'?>
+<net>
+  <tlLogic id="200" type="static" programID="0" offset="0">
+    <phase duration="23" state="rrrr"/>
+    <phase duration="7" state="rrrr"/>
+  </tlLogic>
+  <edge id="south" from="n1" to="j2">
+    <lane id="south_0" index="0" speed="13.9" length="10" shape="0,-10 0,0"/>
+  </edge>
+  <edge id="north" from="n2" to="j2">
+    <lane id="north_0" index="0" speed="13.9" length="10" shape="0,10 0,0"/>
+  </edge>
+  <edge id="west" from="n3" to="j2">
+    <lane id="west_0" index="0" speed="13.9" length="10" shape="-10,0 0,0"/>
+  </edge>
+  <edge id="east" from="n4" to="j2">
+    <lane id="east_0" index="0" speed="13.9" length="10" shape="10,0 0,0"/>
+  </edge>
+  <edge id="out1" from="j2" to="m1"><lane id="out1_0" index="0" speed="13.9" length="10" shape="0,0 0,10"/></edge>
+  <edge id="out2" from="j2" to="m2"><lane id="out2_0" index="0" speed="13.9" length="10" shape="0,0 0,-10"/></edge>
+  <edge id="out3" from="j2" to="m3"><lane id="out3_0" index="0" speed="13.9" length="10" shape="0,0 10,0"/></edge>
+  <edge id="out4" from="j2" to="m4"><lane id="out4_0" index="0" speed="13.9" length="10" shape="0,0 -10,0"/></edge>
+  <connection from="south" to="out1" fromLane="0" toLane="0" tl="200" linkIndex="0" dir="s" state="r" shape="0,-1 0,1"/>
+  <connection from="north" to="out2" fromLane="0" toLane="0" tl="200" linkIndex="3" dir="s" state="r" shape="0,1 0,-1"/>
+  <connection from="west" to="out3" fromLane="0" toLane="0" tl="200" linkIndex="5" dir="s" state="r" shape="-1,0 1,0"/>
+  <connection from="east" to="out4" fromLane="0" toLane="0" tl="200" linkIndex="7" dir="s" state="r" shape="1,0 -1,0"/>
+</net>
+"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            net_path = f"{tmp_dir}/test.net.xml"
+            with open(net_path, "w", encoding="utf-8") as fh:
+                fh.write(net_xml)
+
+            rewritten = rewrite_net_xml_with_japanese_default_tls(net_path)
+            self.assertEqual(1, rewritten)
+
+            tree = importlib.import_module("xml.etree.ElementTree").parse(net_path)
+            root = tree.getroot()
+            tl_logic = root.find(".//tlLogic[@id='200']")
+            states = [phase.attrib["state"] for phase in tl_logic.findall("phase")]
+            self.assertTrue(states)
+            self.assertTrue(all(len(state) >= 8 for state in states))
+
+    def test_rewrite_net_xml_with_japanese_default_tls_pairs_opposites_in_final_net(self):
+        net_xml = """<?xml version='1.0' encoding='UTF-8'?>
+<net>
+  <tlLogic id="300" type="static" programID="0" offset="0">
+    <phase duration="23" state="rrrrrrr"/>
+    <phase duration="7" state="rrrrrrr"/>
+  </tlLogic>
+  <edge id="south" from="n1" to="j3">
+    <lane id="south_0" index="0" speed="13.9" length="10" shape="0,-10 0,0"/>
+  </edge>
+  <edge id="north" from="n2" to="j3">
+    <lane id="north_0" index="0" speed="13.9" length="10" shape="0,10 0,0"/>
+  </edge>
+  <edge id="west" from="n3" to="j3">
+    <lane id="west_0" index="0" speed="13.9" length="10" shape="-10,0 0,0"/>
+  </edge>
+  <edge id="east" from="n4" to="j3">
+    <lane id="east_0" index="0" speed="13.9" length="10" shape="10,0 0,0"/>
+  </edge>
+  <edge id="out_n" from="j3" to="m1"><lane id="out_n_0" index="0" speed="13.9" length="10" shape="0,0 0,10"/></edge>
+  <edge id="out_s" from="j3" to="m2"><lane id="out_s_0" index="0" speed="13.9" length="10" shape="0,0 0,-10"/></edge>
+  <edge id="out_e" from="j3" to="m3"><lane id="out_e_0" index="0" speed="13.9" length="10" shape="0,0 10,0"/></edge>
+  <edge id="out_w" from="j3" to="m4"><lane id="out_w_0" index="0" speed="13.9" length="10" shape="0,0 -10,0"/></edge>
+  <connection from="south" to="out_n" fromLane="0" toLane="0" tl="300" linkIndex="0" dir="s" state="r" shape="0,-1 0,1"/>
+  <connection from="north" to="out_s" fromLane="0" toLane="0" tl="300" linkIndex="2" dir="s" state="r" shape="0,1 0,-1"/>
+  <connection from="west" to="out_e" fromLane="0" toLane="0" tl="300" linkIndex="4" dir="s" state="r" shape="-1,0 1,0"/>
+  <connection from="east" to="out_w" fromLane="0" toLane="0" tl="300" linkIndex="6" dir="s" state="r" shape="1,0 -1,0"/>
+</net>
+"""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            net_path = f"{tmp_dir}/test.net.xml"
+            with open(net_path, "w", encoding="utf-8") as fh:
+                fh.write(net_xml)
+
+            rewritten = rewrite_net_xml_with_japanese_default_tls(net_path)
+            self.assertEqual(1, rewritten)
+
+            tree = importlib.import_module("xml.etree.ElementTree").parse(net_path)
+            root = tree.getroot()
+            tl_logic = root.find(".//tlLogic[@id='300']")
+            self.assertEqual("jp_default_300", tl_logic.attrib["programID"])
+            phases = tl_logic.findall("phase")
+            self.assertEqual(6, len(phases))
+
+            green_states = [phases[0].attrib["state"], phases[3].attrib["state"]]
+            green_sets = [
+                {index for index, signal in enumerate(state) if signal.lower() == "g"}
+                for state in green_states
+            ]
+            self.assertIn({0, 2}, green_sets)
+            self.assertIn({4, 6}, green_sets)
 
     def test_split_lanelet_ids_by_compatibility_splits_mixed_types(self):
         lanelets = [
